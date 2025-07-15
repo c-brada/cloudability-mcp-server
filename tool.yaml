@@ -1,0 +1,787 @@
+name: cloudability
+description: "Comprehensive Cloudability API MCP server for cost management, container analytics, and budget forecasting."
+version: "0.1.0"
+authentication:
+  type: flexible
+  instructions: |
+    Supports both Bearer token and Basic authentication:
+    - Bearer Token (Recommended): "Bearer your-apptio-opentoken"
+    - Basic Auth (Legacy): "Basic your-api-key:"
+
+    Set CLOUDABILITY_ENVIRONMENT_ID for Bearer token authentication.
+
+regions:
+  - name: "US"
+    url: "https://api.cloudability.com/v3"
+  - name: "EU"
+    url: "https://api-eu.cloudability.com/v3"
+  - name: "APAC"
+    url: "https://api-au.cloudability.com/v3"
+  - name: "ME"
+    url: "https://api-me.cloudability.com/v3"
+
+categories:
+  - name: "Container Analytics"
+    description: "🔥 Kubernetes cost allocation, provisioning, and resource analysis"
+    priority: "high"
+  - name: "Cost Reporting"
+    description: "Advanced cost analysis with 15 dimensions and 8 metrics"
+    priority: "high"
+  - name: "Budgets & Forecasting"
+    description: "Budget management and spending predictions"
+    priority: "medium"
+  - name: "Core Resources"
+    description: "Clusters, billing accounts, and basic information"
+    priority: "medium"
+  - name: "Legacy Endpoints"
+    description: "Backward compatibility endpoints"
+    priority: "low"
+
+actions:
+  # ============================================================================
+  # 🔥 CONTAINER ANALYTICS TOOLS (HIGH PRIORITY)
+  # ============================================================================
+
+  provision_kubernetes_cluster:
+    category: "Container Analytics"
+    description: "Provision a new Kubernetes cluster for Cloudability monitoring with automated Metrics Agent deployment"
+    input_schema:
+      type: object
+      required: ["cluster_name", "authorization"]
+      properties:
+        cluster_name:
+          type: string
+          description: "Name for the new cluster"
+        kubernetes_version:
+          type: string
+          description: "Kubernetes version (optional)"
+        cluster_version:
+          type: string
+          description: "Cluster version (optional)"
+        authorization:
+          type: string
+          description: "Bearer token or Basic auth header"
+    output_schema:
+      type: object
+      properties:
+        result:
+          type: object
+          properties:
+            id:
+              type: string
+              description: "Cluster ID for deployment configuration"
+
+  get_cluster_deployment_yaml:
+    category: "Container Analytics"
+    description: "Get Kubernetes deployment YAML for installing Cloudability Metrics Agent"
+    input_schema:
+      type: object
+      required: ["cluster_id", "authorization"]
+      properties:
+        cluster_id:
+          type: string
+          description: "ID of the provisioned cluster"
+        authorization:
+          type: string
+          description: "Bearer token or Basic auth header"
+    output_schema:
+      type: object
+      properties:
+        deployment_yaml:
+          type: string
+          description: "Complete Kubernetes deployment configuration"
+
+  analyze_container_cost_allocations:
+    category: "Container Analytics"
+    description: "🔥 PRIMARY TOOL: Comprehensive Kubernetes cost allocation with fair share calculations"
+    priority: "critical"
+    input_schema:
+      type: object
+      required: ["start_date", "end_date", "authorization"]
+      properties:
+        start_date:
+          type: string
+          format: date
+          description: "Start date (YYYY-MM-DD)"
+        end_date:
+          type: string
+          format: date
+          description: "End date (YYYY-MM-DD)"
+        group:
+          type: array
+          items:
+            type: string
+          description: "Grouping dimensions (namespace, service, deployment, pod, labels)"
+          examples:
+            [["namespace"], ["namespace", "service"], ["cldy:labels:team"]]
+        metrics:
+          type: array
+          items:
+            type: string
+          description: "Resource metrics (cpu/reserved, memory/reserved_rss, network/tx)"
+          examples: [["cpu/reserved", "memory/reserved_rss"]]
+        filters:
+          type: array
+          items:
+            type: string
+          description: "Filter expressions (cluster==uuid, namespace==production)"
+          examples: [["cluster==uuid", "namespace==production"]]
+        cost_type:
+          type: string
+          enum: ["adjusted_cost", "adjusted_amortized_cost"]
+          default: "adjusted_cost"
+          description: "Cost calculation method"
+        authorization:
+          type: string
+          description: "Bearer token or Basic auth header"
+    output_schema:
+      type: object
+      properties:
+        results:
+          type: array
+          description: "Cost allocations with fair share calculations and resource metrics"
+
+  get_container_resource_usage:
+    category: "Container Analytics"
+    description: "Daily container resource usage trends for capacity planning and rightsizing"
+    input_schema:
+      type: object
+      required: ["start_date", "end_date", "authorization"]
+      properties:
+        start_date:
+          type: string
+          format: date
+        end_date:
+          type: string
+          format: date
+        metrics:
+          type: array
+          items:
+            type: string
+          description: "Resource metrics to analyze"
+        filters:
+          type: array
+          items:
+            type: string
+          description: "Filter expressions"
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        results:
+          type: array
+          description: "Daily usage trends and patterns"
+
+  discover_container_labels:
+    category: "Container Analytics"
+    description: "Find available Kubernetes labels for custom cost allocation groupings"
+    input_schema:
+      type: object
+      required: ["start_date", "end_date", "authorization"]
+      properties:
+        start_date:
+          type: string
+          format: date
+        end_date:
+          type: string
+          format: date
+        filters:
+          type: array
+          items:
+            type: string
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        results:
+          type: array
+          description: "Available label keys for cost allocation"
+
+  count_container_resources:
+    category: "Container Analytics"
+    description: "Resource inventory - count namespaces, services, pods across clusters"
+    input_schema:
+      type: object
+      required: ["start_date", "end_date", "dimensions", "authorization"]
+      properties:
+        start_date:
+          type: string
+          format: date
+        end_date:
+          type: string
+          format: date
+        dimensions:
+          type: array
+          items:
+            type: string
+          description: "Dimensions to count (namespace, service, pod)"
+        group:
+          type: array
+          items:
+            type: string
+          description: "Grouping dimensions"
+        filters:
+          type: array
+          items:
+            type: string
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        results:
+          type: array
+          description: "Resource counts by dimension"
+
+  get_detailed_cluster_info:
+    category: "Container Analytics"
+    description: "Comprehensive cluster metadata with node details and data collection status"
+    input_schema:
+      type: object
+      required: ["start_date", "end_date", "authorization"]
+      properties:
+        start_date:
+          type: string
+          format: date
+        end_date:
+          type: string
+          format: date
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        results:
+          type: array
+          description: "Detailed cluster and node information"
+
+  # ============================================================================
+  # 📊 COST REPORTING TOOLS (HIGH PRIORITY)
+  # ============================================================================
+
+  execute_cost_report:
+    category: "Cost Reporting"
+    description: "Primary cost reporting tool with advanced analytics and flexible configuration"
+    priority: "high"
+    input_schema:
+      type: object
+      required:
+        ["start_date", "end_date", "dimensions", "metrics", "authorization"]
+      properties:
+        start_date:
+          type: string
+          format: date
+          description: "Start date or relative date (beginning of last month)"
+        end_date:
+          type: string
+          format: date
+          description: "End date or relative date (end of this quarter)"
+        dimensions:
+          type: array
+          items:
+            type: string
+          maxItems: 15
+          description: "Grouping dimensions (vendor, region, service_name, resource_identifier)"
+          examples:
+            [["vendor", "region"], ["service_name", "resource_identifier"]]
+        metrics:
+          type: array
+          items:
+            type: string
+          maxItems: 8
+          description: "Cost/usage metrics (total_cost, amortized_cost, usage_hours)"
+          examples: [["total_amortized_cost", "usage_hours"]]
+        filters:
+          type: array
+          items:
+            type: string
+          description: "Filter expressions (transaction_type==usage, total_cost>100)"
+          examples: [["transaction_type==usage", "vendor==Amazon"]]
+        sort:
+          type: array
+          items:
+            type: string
+          description: "Sort expressions (total_costDESC, vendorASC)"
+        limit:
+          type: integer
+          maximum: 10000
+          description: "Maximum rows to return"
+        offset:
+          type: integer
+          description: "Pagination offset"
+        chart:
+          type: boolean
+          default: false
+          description: "Format for chart visualization"
+        view_id:
+          type: string
+          default: "0"
+          description: "Apply saved view (0 for unrestricted)"
+        apply_allocations:
+          type: boolean
+          default: false
+          description: "Include post-allocated costs"
+        authorization:
+          type: string
+          description: "Bearer token or Basic auth header"
+    output_schema:
+      type: object
+      properties:
+        results:
+          type: array
+          description: "Cost report data with pagination support"
+
+  queue_cost_report:
+    category: "Cost Reporting"
+    description: "Asynchronous reporting for long-running or complex reports"
+    input_schema:
+      type: object
+      required:
+        ["start_date", "end_date", "dimensions", "metrics", "authorization"]
+      properties:
+        start_date:
+          type: string
+          format: date
+        end_date:
+          type: string
+          format: date
+        dimensions:
+          type: array
+          items:
+            type: string
+          maxItems: 15
+        metrics:
+          type: array
+          items:
+            type: string
+          maxItems: 8
+        filters:
+          type: array
+          items:
+            type: string
+        sort:
+          type: array
+          items:
+            type: string
+        limit:
+          type: integer
+          maximum: 30000
+          description: "Higher limit for queued reports"
+        offset:
+          type: integer
+        chart:
+          type: boolean
+          default: false
+        view_id:
+          type: string
+          default: "0"
+        apply_allocations:
+          type: boolean
+          default: false
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        id:
+          type: string
+          description: "Report ID for status checking"
+
+  check_report_status:
+    category: "Cost Reporting"
+    description: "Check processing status of a queued cost report"
+    input_schema:
+      type: object
+      required: ["report_id", "authorization"]
+      properties:
+        report_id:
+          type: string
+          description: "Report ID from queue_cost_report"
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: ["queued", "processing", "finished", "failed"]
+
+  get_queued_report_results:
+    category: "Cost Reporting"
+    description: "Retrieve results from a completed queued cost report"
+    input_schema:
+      type: object
+      required: ["report_id", "authorization"]
+      properties:
+        report_id:
+          type: string
+          description: "ID of the finished report"
+        token:
+          type: string
+          description: "Optional pagination token"
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        results:
+          type: array
+          description: "Report results with pagination"
+
+  get_available_measures:
+    category: "Cost Reporting"
+    description: "Explore dimensions and metrics with detailed metadata and grouping"
+    input_schema:
+      type: object
+      required: ["authorization"]
+      properties:
+        apply_allocations:
+          type: boolean
+          description: "Filter to allocation-supported measures only"
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        dimensions:
+          type: array
+          description: "Available grouping dimensions"
+        metrics:
+          type: array
+          description: "Available cost/usage metrics"
+
+  get_filter_operators:
+    category: "Cost Reporting"
+    description: "Reference guide for all supported filter comparison operators"
+    input_schema:
+      type: object
+      required: ["authorization"]
+      properties:
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        operators:
+          type: array
+          description: "Available filter operators (==, !=, >, <, =@, []=)"
+
+  list_saved_cost_reports:
+    category: "Cost Reporting"
+    description: "Discover available reports with complete configurations and sharing info"
+    input_schema:
+      type: object
+      required: ["authorization"]
+      properties:
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        reports:
+          type: array
+          description: "Saved reports with configurations"
+
+  # ============================================================================
+  # 💰 BUDGETS & FORECASTING TOOLS (MEDIUM PRIORITY)
+  # ============================================================================
+
+  get_spending_estimate:
+    category: "Budgets & Forecasting"
+    description: "Current month spending projections with detailed service breakdowns"
+    input_schema:
+      type: object
+      required: ["authorization"]
+      properties:
+        view_id:
+          type: string
+          default: "0"
+          description: "View ID for filtering"
+        basis:
+          type: string
+          enum: ["cash", "adjusted"]
+          default: "cash"
+          description: "Cost basis for calculations"
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        estimate:
+          type: object
+          description: "Current month spending estimate with service breakdown"
+
+  get_spending_forecast:
+    category: "Budgets & Forecasting"
+    description: "Multi-month predictive analytics with confidence intervals"
+    input_schema:
+      type: object
+      required: ["authorization"]
+      properties:
+        view_id:
+          type: string
+          default: "0"
+        basis:
+          type: string
+          enum: ["cash", "adjusted"]
+          default: "cash"
+        months_back:
+          type: integer
+          minimum: 3
+          maximum: 24
+          default: 6
+          description: "Historical months for modeling"
+        months_forward:
+          type: integer
+          minimum: 1
+          maximum: 24
+          default: 12
+          description: "Forecast horizon"
+        use_current_estimate:
+          type: boolean
+          default: false
+          description: "Include current month in model"
+        remove_credits:
+          type: boolean
+          default: false
+          description: "Exclude credits from analysis"
+        remove_one_time_charges:
+          type: boolean
+          default: false
+          description: "Filter out one-time costs"
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        forecast:
+          type: object
+          description: "Monthly forecasts with confidence intervals"
+
+  create_new_budget:
+    category: "Budgets & Forecasting"
+    description: "Create budgets with monthly thresholds and cost basis configuration"
+    input_schema:
+      type: object
+      required: ["name", "basis", "authorization"]
+      properties:
+        name:
+          type: string
+          description: "Budget name"
+        basis:
+          type: string
+          enum: ["cash", "adjusted"]
+          description: "Cost basis for budget calculations"
+        view_id:
+          type: string
+          default: "0"
+          description: "View ID for budget scope"
+        months:
+          type: array
+          items:
+            type: object
+            properties:
+              month:
+                type: string
+                format: date
+                description: "Month in YYYY-MM format"
+              threshold:
+                type: number
+                description: "Budget threshold amount"
+          description: "Monthly budget thresholds"
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        result:
+          type: object
+          description: "Created budget details"
+
+  list_budgets:
+    category: "Budgets & Forecasting"
+    description: "Get all budget configurations with current status and thresholds"
+    input_schema:
+      type: object
+      required: ["authorization"]
+      properties:
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        budgets:
+          type: array
+          description: "List of budgets with configurations"
+
+  get_budget:
+    category: "Budgets & Forecasting"
+    description: "Get detailed budget information including spend tracking and alerts"
+    input_schema:
+      type: object
+      required: ["budget_id", "authorization"]
+      properties:
+        budget_id:
+          type: string
+          description: "Budget UUID"
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        budget:
+          type: object
+          description: "Detailed budget information"
+
+  # ============================================================================
+  # 🏢 CORE RESOURCES (MEDIUM PRIORITY)
+  # ============================================================================
+
+  list_clusters:
+    category: "Core Resources"
+    description: "Get all Kubernetes clusters with UUIDs and metadata"
+    input_schema:
+      type: object
+      required: ["authorization"]
+      properties:
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        clusters:
+          type: array
+          description: "List of clusters with UUIDs and metadata"
+
+  list_billing_accounts:
+    category: "Core Resources"
+    description: "Get billing account information across cloud providers"
+    input_schema:
+      type: object
+      required: ["authorization"]
+      properties:
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        accounts:
+          type: array
+          description: "Billing accounts with configurations"
+
+  containers_report:
+    category: "Core Resources"
+    description: "Legacy container cost reporting endpoint"
+    input_schema:
+      type: object
+      required: ["start_date", "end_date", "authorization"]
+      properties:
+        start_date:
+          type: string
+          format: date
+        end_date:
+          type: string
+          format: date
+        cost_type:
+          type: string
+          default: "adjusted"
+        metrics:
+          type: array
+          items:
+            type: string
+        group:
+          type: array
+          items:
+            type: string
+        filters:
+          type: array
+          items:
+            type: string
+        widget_type:
+          type: string
+          default: "top"
+        limit:
+          type: integer
+          default: 50
+        sort:
+          type: array
+          items:
+            type: object
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        results:
+          type: array
+
+  # ============================================================================
+  # 🔄 LEGACY ENDPOINTS (LOW PRIORITY)
+  # ============================================================================
+
+  get_cost_reports:
+    category: "Legacy Endpoints"
+    description: "Legacy cost reports endpoint for backward compatibility"
+    input_schema:
+      type: object
+      required: ["start_date", "end_date", "authorization"]
+      properties:
+        start_date:
+          type: string
+          format: date
+        end_date:
+          type: string
+          format: date
+        dimensions:
+          type: array
+          items:
+            type: string
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        results:
+          type: array
+
+  get_usage_data:
+    category: "Legacy Endpoints"
+    description: "Legacy usage data endpoint for backward compatibility"
+    input_schema:
+      type: object
+      required: ["period", "authorization"]
+      properties:
+        period:
+          type: string
+          description: "Usage period (e.g., last_30_days)"
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        usage_records:
+          type: array
+
+# ============================================================================
+# RATE LIMITS & USAGE NOTES
+# ============================================================================
+
+rate_limits:
+  container_apis:
+    user_limit: "10 requests/user/minute"
+    org_limit: "20 requests/organization/minute"
+  cost_reports:
+    user_limit: "20 requests/user/minute"
+  budgets:
+    user_limit: "Standard rate limits apply"
+
+usage_notes:
+  - "Container analytics APIs are the most important and frequently used"
+  - "Use analyze_container_cost_allocations for primary Kubernetes cost analysis"
+  - "Bearer token authentication is recommended for modern environments"
+  - "Basic auth is supported for legacy API key authentication"
+  - "Set CLOUDABILITY_ENVIRONMENT_ID for Bearer token authentication"
+  - "Queued reports support larger datasets (30K vs 10K rows)"
+  - "Relative dates supported: 'beginning of last month', 'end of this quarter'"
