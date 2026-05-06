@@ -1,5 +1,6 @@
 from fastmcp import FastMCP
-from typing import Dict, List, Optional, Any
+from typing import Annotated, Dict, List, Optional, Any
+from pydantic import Field
 from cloudability_tools import (
     get_containers_report,
     get_clusters,
@@ -66,7 +67,7 @@ def containers_report(
     widget_type: str = "top",
     limit: int = 50,
     sort: List[Dict[str, str]] | None = None,
-    view_id: Optional[str] = None,
+    view_id: Annotated[Optional[str], Field(default=None, description="Optional Cloudability view identifier")] = None,
     authorization: str | None = None
 ) -> Dict[str, Any]:
     """
