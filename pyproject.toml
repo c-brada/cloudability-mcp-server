@@ -32,12 +32,6 @@ classifiers = [
 ]
 requires-python = ">=3.12"
 
-[project.urls]
-Homepage = "https://github.com/your-org/cloudability-mcp-server"
-Repository = "https://github.com/your-org/cloudability-mcp-server"
-Issues = "https://github.com/your-org/cloudability-mcp-server/issues"
-Documentation = "https://github.com/your-org/cloudability-mcp-server#readme"
-
 dependencies = [
     "fastapi>=0.116.1",
     "fastmcp>=0.19.0",
@@ -47,6 +41,13 @@ dependencies = [
     "requests>=2.28.2",
     "uvicorn>=0.35.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/your-org/cloudability-mcp-server"
+Repository = "https://github.com/your-org/cloudability-mcp-server"
+Issues = "https://github.com/your-org/cloudability-mcp-server/issues"
+Documentation = "https://github.com/your-org/cloudability-mcp-server#readme"
+
 
 [dependency-groups]
 dev = [
