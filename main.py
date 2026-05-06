@@ -422,7 +422,7 @@ def list_saved_cost_reports(authorization: str | None = None) -> Dict[str, Any]:
     Returns:
         List of cost report objects with complete configurations and metadata
     """
-    return list_cost_reports(authorization)
+    return {"result": list_cost_reports(authorization)}
 
 @mcp.tool()
 def get_available_measures(
@@ -445,7 +445,7 @@ def get_available_measures(
         - Metrics: total_cost, amortized_cost, usage_hours, etc.
         - Each with data_type, description, group, and sub_group info
     """
-    return get_cost_measures(apply_allocations, authorization)
+    return {"result": get_cost_measures(apply_allocations, authorization)}
 
 @mcp.tool()
 def get_filter_operators(authorization: str | None = None) -> Dict[str, Any]:
@@ -465,7 +465,7 @@ def get_filter_operators(authorization: str | None = None) -> Dict[str, Any]:
         - []= (in), []!= (not in)
         - === (strictly equals), !== (strictly not equals)
     """
-    return get_cost_filter_operators(authorization)
+    return {"result": get_cost_filter_operators(authorization)}
 
 @mcp.tool()
 def execute_cost_report(
