@@ -1,6 +1,24 @@
 from fastmcp import FastMCP
 from typing import Annotated, Dict, List, Optional, Any
-from pydantic import Field
+from pydantic import Field,BeforeValidator
+import json as _json
+
+
+def _coerce_str_list(v: Any) -> Any:
+    """Accept a JSON-encoded string in place of a list, e.g. '["a","b"]' → ["a","b"]."""
+    if isinstance(v, str):
+        try:
+            parsed = _json.loads(v)
+            if isinstance(parsed, list):
+                return parsed
+        except (_json.JSONDecodeError, ValueError):
+            pass
+        return [v]  # single bare string → one-element list
+    return v
+
+
+StrList = Annotated[List[str], BeforeValidator(_coerce_str_list)]
+
 from cloudability_tools import (
     get_containers_report,
     get_clusters,
@@ -61,9 +79,9 @@ def containers_report(
     start_date: str,
     end_date: str,
     cost_type: str = "adjusted",
-    metrics: List[str] | None = None,
-    group: List[str] | None = None,
-    filters: List[str] | None = None,
+    metrics: StrList | None = None,
+    group: StrList | None = None,
+    filters: StrList | None = None,
     widget_type: str = "top",
     limit: int = 50,
     sort: List[Dict[str, str]] | None = None,
@@ -472,10 +490,10 @@ def get_filter_operators(authorization: str | None = None) -> Dict[str, Any]:
 def execute_cost_report(
     start_date: str,
     end_date: str,
-    dimensions: List[str],
-    metrics: List[str],
-    filters: List[str] | None = None,
-    sort: List[str] | None = None,
+    dimensions: StrList,
+    metrics: StrList,
+    filters: StrList | None = None,
+    sort: StrList | None = None,
     limit: int | None = None,
     offset: int | None = None,
     chart: bool = False,
@@ -535,10 +553,10 @@ def execute_cost_report(
 def queue_cost_report(
     start_date: str,
     end_date: str,
-    dimensions: List[str],
-    metrics: List[str],
-    filters: List[str] | None = None,
-    sort: List[str] | None = None,
+    dimensions: StrList,
+    metrics: StrList,
+    filters: StrList | None = None,
+    sort: StrList | None = None,
     limit: int | None = None,
     offset: int | None = None,
     chart: bool = False,
@@ -750,9 +768,9 @@ def get_detailed_cluster_info(
 def analyze_container_cost_allocations(
     start_date: str,
     end_date: str,
-    group: List[str] | None = None,
-    metrics: List[str] | None = None,
-    filters: List[str] | None = None,
+    group: StrList | None = None,
+    metrics: StrList | None = None,
+    filters: StrList | None = None,
     cost_type: str = "adjusted_cost",
     authorization: str | None = None
 ) -> Dict[str, Any]:
@@ -808,8 +826,8 @@ def analyze_container_cost_allocations(
 def get_container_resource_usage(
     start_date: str,
     end_date: str,
-    metrics: List[str] | None = None,
-    filters: List[str] | None = None,
+    metrics: StrList | None = None,
+    filters: StrList | None = None,
     authorization: str | None = None
 ) -> Dict[str, Any]:
     """
@@ -844,7 +862,7 @@ def get_container_resource_usage(
 def discover_container_labels(
     start_date: str,
     end_date: str,
-    filters: List[str] | None = None,
+    filters: StrList | None = None,
     authorization: str | None = None
 ) -> Dict[str, Any]:
     """
@@ -873,9 +891,9 @@ def discover_container_labels(
 def count_container_resources(
     start_date: str,
     end_date: str,
-    dimensions: List[str],
-    group: List[str] | None = None,
-    filters: List[str] | None = None,
+    dimensions: StrList,
+    group: StrList | None = None,
+    filters: StrList | None = None,
     authorization: str | None = None
 ) -> Dict[str, Any]:
     """
