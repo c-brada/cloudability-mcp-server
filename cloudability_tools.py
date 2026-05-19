@@ -894,6 +894,28 @@ def get_cost_filter_operators(authorization: str | None = None) -> Dict[str, Any
     response.raise_for_status()
     return response.json()
 
+def _apply_sort(params: Dict[str, Any], sort: List[str] | None) -> None:
+    """Map a sort expression to the params Cloudability actually accepts.
+
+    The /reporting/cost/run endpoint expects ``sort_by=<field>`` plus an
+    optional ``order=asc|desc``. Sending ``sort=<field>`` returns
+    HTTP 422 "Invalid sort direction". Accept the documented
+    ``"<field>ASC"`` / ``"<field>DESC"`` expression form (or a bare field
+    name) and split it; order defaults to ``desc``.
+    """
+    if not sort:
+        return
+    expr = sort[0].strip()
+    order = "desc"
+    upper = expr.upper()
+    if upper.endswith("ASC"):
+        expr, order = expr[:-3], "asc"
+    elif upper.endswith("DESC"):
+        expr, order = expr[:-4], "desc"
+    params["sort_by"] = expr
+    params["order"] = order
+
+
 def run_cost_report(
     start_date: str,
     end_date: str,
@@ -918,7 +940,9 @@ def run_cost_report(
         dimensions: List of dimensions (max 15, e.g., ["vendor", "region"])
         metrics: List of metrics (max 8, e.g., ["total_amortized_cost", "usage_hours"])
         filters: List of filter expressions (e.g., ["transaction_type==usage"])
-        sort: List of sort expressions (e.g., ["total_amortized_costASC", "regionDESC"])
+        sort: Sort expression as ["<field>"] or ["<field>ASC"]/["<field>DESC"]
+            (order defaults to desc), e.g. ["total_amortized_costDESC"].
+            Sent to the API as sort_by + order.
         limit: Maximum rows to return (default 10000, set 0 for 64000)
         offset: Starting position for results
         chart: Format data for chart purposes (based on dates)
@@ -953,8 +977,7 @@ def run_cost_report(
     if filters:
         for filter_expr in filters:
             params.setdefault("filters", []).append(filter_expr)
-    if sort:
-        params["sort"] = ",".join(sort)
+    _apply_sort(params, sort)
     if limit is not None:
         params["limit"] = limit
     if offset is not None:
@@ -998,7 +1021,8 @@ def enqueue_cost_report(
         dimensions: List of dimensions (max 15)
         metrics: List of metrics (max 8)
         filters: List of filter expressions
-        sort: List of sort expressions
+        sort: Sort expression as ["<field>"] or ["<field>ASC"]/["<field>DESC"]
+            (order defaults to desc); sent to the API as sort_by + order
         limit: Maximum rows to return
         offset: Starting position for results
         chart: Format data for chart purposes
@@ -1034,8 +1058,7 @@ def enqueue_cost_report(
     if filters:
         for filter_expr in filters:
             params.setdefault("filters", []).append(filter_expr)
-    if sort:
-        params["sort"] = ",".join(sort)
+    _apply_sort(params, sort)
     if limit is not None:
         params["limit"] = limit
     if offset is not None:
