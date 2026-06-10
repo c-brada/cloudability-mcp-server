@@ -6,13 +6,15 @@ from pathlib import Path
 # Add the parent directory to the Python path so we can import modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import requests
 import responses
+import cloudability_tools
 from cloudability_tools import (
     get_containers_report,
     get_clusters,
     get_budgets,
     get_budget_details,
-    get_billing_accounts,
+    get_vendor_accounts,
     # Budgets & Forecasting APIs
     get_estimate,
     get_forecast,
@@ -38,11 +40,14 @@ from cloudability_tools import (
     list_provisioned_clusters,
     update_provisioned_cluster,
     get_container_clusters,
-    get_container_allocations,
     get_container_usage,
     get_container_labels,
-    get_container_counts,
-    CLOUDABILITY_API_URL
+    fetch_apptio_opentoken,
+    invalidate_opentoken_cache,
+    resolve_authorization,
+    _OpentokenCacheEntry,
+    CLOUDABILITY_API_URL,
+    CLOUDABILITY_FRONTDOOR_URL,
 )
 
 # Set up environment for Bearer token tests
@@ -72,8 +77,9 @@ def basic_auth():
 # ============================================================================
 
 @responses.activate
-def test_get_containers_report_success(cloudability_url, auth_token):
+def test_get_containers_report_success(cloudability_url, auth_token, monkeypatch):
     """Test successful containers report request."""
+    monkeypatch.setenv("CLOUDABILITY_DEFAULT_VIEW_ID", "12345")
     responses.add(
         responses.POST,
         f"{cloudability_url}/containers/report",
@@ -111,10 +117,12 @@ def test_get_containers_report_success(cloudability_url, auth_token):
     assert "data" in result["result"]
     assert len(result["result"]["data"]) == 1
     assert result["result"]["data"][0]["dimensions"]["namespace"] == "kube-system"
+    assert responses.calls[0].request.url.endswith("viewId=12345")
 
 @responses.activate
-def test_get_containers_report_with_filters(cloudability_url, auth_token):
+def test_get_containers_report_with_filters(cloudability_url, auth_token, monkeypatch):
     """Test containers report with filters."""
+    monkeypatch.setenv("CLOUDABILITY_DEFAULT_VIEW_ID", "12345")
     responses.add(
         responses.POST,
         f"{cloudability_url}/containers/report",
@@ -122,7 +130,7 @@ def test_get_containers_report_with_filters(cloudability_url, auth_token):
         status=200,
     )
 
-    result = get_containers_report(
+    get_containers_report(
         start_date="2024-01-01",
         end_date="2024-01-31",
         filters=["cluster==test-cluster-uuid", "namespace==production"],
@@ -132,35 +140,193 @@ def test_get_containers_report_with_filters(cloudability_url, auth_token):
     # Verify the request was made with correct filters
     request_body = responses.calls[0].request.body
     assert b'"filters": ["cluster==test-cluster-uuid", "namespace==production"]' in request_body
+    assert responses.calls[0].request.url.endswith("viewId=12345")
 
 @responses.activate
-def test_get_clusters_success(cloudability_url, auth_token):
-    """Test successful clusters list request."""
+def test_get_containers_report_with_count(cloudability_url, auth_token, monkeypatch):
+    """Test containers report passes count dimensions in the request body."""
+    monkeypatch.setenv("CLOUDABILITY_DEFAULT_VIEW_ID", "12345")
     responses.add(
-        responses.GET,
-        f"{cloudability_url}/containers/clusters",
+        responses.POST,
+        f"{cloudability_url}/containers/report",
         json={
-            "result": [
-                {
-                    "id": "cluster-uuid-1",
-                    "name": "production-cluster",
-                    "provider": "aws"
-                },
-                {
-                    "id": "cluster-uuid-2", 
-                    "name": "staging-cluster",
-                    "provider": "gcp"
-                }
-            ]
+            "result": {
+                "data": [
+                    {
+                        "count": [{"key": "namespace", "value": "9"}],
+                        "dimensions": {"cluster": "cluster-uuid"},
+                        "metrics": {
+                            "total_cost": {"unit": "currency", "values": [100.0]}
+                        },
+                    }
+                ],
+                "pagination": {"hasNext": False},
+            }
         },
         status=200,
     )
 
-    result = get_clusters(authorization=auth_token)
-    
+    result = get_containers_report(
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+        group=["cluster"],
+        count=["namespace"],
+        metrics=["total_cost"],
+        authorization=auth_token,
+    )
+
+    request_body = responses.calls[0].request.body
+    assert b'"count": ["namespace"]' in request_body
+    assert b'"group": ["cluster"]' in request_body
+    assert result["result"]["data"][0]["count"][0]["value"] == "9"
+
+@responses.activate
+def test_get_containers_report_requires_view_id(cloudability_url, auth_token, monkeypatch):
+    """Test containers report requires view_id when default is unset."""
+    monkeypatch.delenv("CLOUDABILITY_DEFAULT_VIEW_ID", raising=False)
+
+    with pytest.raises(ValueError, match="view_id is required"):
+        get_containers_report(
+            start_date="2024-01-01",
+            end_date="2024-01-31",
+            authorization=auth_token,
+        )
+
+
+@responses.activate
+def test_get_containers_report_kpi_remapped_to_top(
+    cloudability_url, auth_token, monkeypatch
+):
+    """Test kpi widget_type is remapped to top before calling the API."""
+    monkeypatch.setenv("CLOUDABILITY_DEFAULT_VIEW_ID", "12345")
+    responses.add(
+        responses.POST,
+        f"{cloudability_url}/containers/report",
+        json={"result": {"data": [], "pagination": {"hasNext": False}}},
+        status=200,
+    )
+
+    result = get_containers_report(
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+        widget_type="kpi",
+        metrics=["total_cost"],
+        authorization=auth_token,
+    )
+
+    request_body = responses.calls[0].request.body
+    assert b'"widgetType": "top"' in request_body
+    assert b'"group"' not in request_body
+    assert result["_kpi_remapped_to_top"] is True
+
+
+@responses.activate
+def test_get_containers_report_kpi_with_cluster_filter_adds_group(
+    cloudability_url, auth_token, monkeypatch
+):
+    """Test kpi with cluster filter adds cluster group for aggregate totals."""
+    monkeypatch.setenv("CLOUDABILITY_DEFAULT_VIEW_ID", "12345")
+    responses.add(
+        responses.POST,
+        f"{cloudability_url}/containers/report",
+        json={"result": {"data": [], "pagination": {"hasNext": False}}},
+        status=200,
+    )
+
+    get_containers_report(
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+        widget_type="kpi",
+        metrics=["total_cost"],
+        filters=["cluster==test-cluster-uuid"],
+        authorization=auth_token,
+    )
+
+    request_body = responses.calls[0].request.body
+    assert b'"widgetType": "top"' in request_body
+    assert b'"group": ["cluster"]' in request_body
+
+
+@responses.activate
+def test_get_containers_report_rejects_cluster_name_filter(
+    cloudability_url, auth_token, monkeypatch
+):
+    """Test clusterName filter is rejected with an actionable error."""
+    monkeypatch.setenv("CLOUDABILITY_DEFAULT_VIEW_ID", "12345")
+
+    with pytest.raises(ValueError, match="clusterName"):
+        get_containers_report(
+            start_date="2024-01-01",
+            end_date="2024-01-31",
+            filters=["clusterName==k8s-cluster"],
+            authorization=auth_token,
+        )
+
+
+@responses.activate
+def test_get_containers_report_pagination_token(
+    cloudability_url, auth_token, monkeypatch
+):
+    """Test pagination_token is sent as paginationToken in the request body."""
+    monkeypatch.setenv("CLOUDABILITY_DEFAULT_VIEW_ID", "12345")
+    responses.add(
+        responses.POST,
+        f"{cloudability_url}/containers/report",
+        json={"result": {"data": [], "pagination": {"hasNext": False}}},
+        status=200,
+    )
+
+    get_containers_report(
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+        metrics=["total_cost"],
+        group=["namespace"],
+        pagination_token="eyJkYXRhIjpb",
+        authorization=auth_token,
+    )
+
+    request_body = responses.calls[0].request.body
+    assert b'"paginationToken": "eyJkYXRhIjpb"' in request_body
+
+
+@responses.activate
+def test_get_clusters_success(cloudability_url, auth_token, monkeypatch):
+    """Test successful clusters list request."""
+    monkeypatch.setenv("CLOUDABILITY_DEFAULT_VIEW_ID", "12345")
+    responses.add(
+        responses.GET,
+        f"{cloudability_url}/containers/v2/clusters",
+        json={
+            "result": {
+                "clusters": [
+                    {
+                        "id": "cluster-uuid-1",
+                        "name": "production-cluster",
+                        "vendor": "azure",
+                        "clusterType": "aks",
+                    },
+                    {
+                        "id": "cluster-uuid-2",
+                        "name": "staging-cluster",
+                        "vendor": "gcp",
+                        "clusterType": "gke",
+                    },
+                ],
+                "meta": {"orgHasProvisioned": True, "orgHasData": True},
+            }
+        },
+        status=200,
+    )
+
+    result = get_clusters(
+        start_date="2026-04-14",
+        end_date="2026-05-21",
+        authorization=auth_token,
+    )
+
     assert "result" in result
-    assert len(result["result"]) == 2
-    assert result["result"][0]["name"] == "production-cluster"
+    assert len(result["result"]["clusters"]) == 2
+    assert result["result"]["clusters"][0]["name"] == "production-cluster"
 
 # ============================================================================
 # BUDGETS API TESTS
@@ -217,52 +383,89 @@ def test_get_budget_details_success(cloudability_url, basic_auth):
     assert result["result"]["spent"] == 35000.00
 
 # ============================================================================
-# BILLING ACCOUNTS API TESTS
+# VENDOR ACCOUNTS API TESTS
 # ============================================================================
 
+@pytest.mark.parametrize(
+    ("vendor", "path_segment"),
+    [
+        ("aws", "AWS"),
+        ("azure", "azure"),
+        ("gcp", "gcp"),
+    ],
+)
 @responses.activate
-def test_get_billing_accounts_success(cloudability_url, auth_token):
-    """Test successful billing accounts list request."""
+def test_get_vendor_accounts_success(
+    cloudability_url, auth_token, vendor, path_segment
+):
+    """Test successful vendor accounts list request."""
     responses.add(
         responses.GET,
-        f"{cloudability_url}/billing-accounts",
+        f"{cloudability_url}/vendors/{path_segment}/accounts",
         json={
             "result": [
                 {
                     "id": "account-1",
-                    "name": "Production AWS Account",
-                    "provider": "aws",
-                    "account_id": "123456789012"
+                    "name": f"Production {vendor.upper()} Account",
+                    "vendor": vendor,
                 }
             ]
         },
         status=200,
+        match=[responses.matchers.query_param_matcher({"viewId": "0"})],
     )
 
-    result = get_billing_accounts(authorization=auth_token)
-    
+    result = get_vendor_accounts(vendor, authorization=auth_token)
+
     assert "result" in result
     assert len(result["result"]) == 1
-    assert result["result"][0]["provider"] == "aws"
+    assert result["result"][0]["vendor"] == vendor
+
+
+@responses.activate
+def test_get_vendor_accounts_custom_view_id(cloudability_url, auth_token):
+    """Test vendor accounts request with explicit view_id."""
+    responses.add(
+        responses.GET,
+        f"{cloudability_url}/vendors/AWS/accounts",
+        json={"result": []},
+        status=200,
+        match=[responses.matchers.query_param_matcher({"viewId": "55642"})],
+    )
+
+    result = get_vendor_accounts("aws", view_id="55642", authorization=auth_token)
+
+    assert result == {"result": []}
+
+
+def test_get_vendor_accounts_unsupported_vendor(auth_token):
+    """Test that unsupported vendors raise ValueError."""
+    with pytest.raises(ValueError, match="Unsupported vendor"):
+        get_vendor_accounts("databricks", authorization=auth_token)
 
 # ============================================================================
 # ERROR HANDLING TESTS
 # ============================================================================
 
-def test_missing_authorization():
+def test_missing_authorization(monkeypatch):
     """Test that missing authorization raises ValueError."""
+    monkeypatch.delenv("CLOUDABILITY_KEY_ACCESS", raising=False)
+    monkeypatch.delenv("CLOUDABILITY_KEY_SECRET", raising=False)
+    invalidate_opentoken_cache()
+
     with pytest.raises(ValueError, match="Authorization token is required"):
         get_containers_report("2024-01-01", "2024-01-31")
 
     with pytest.raises(ValueError, match="Authorization token is required"):
-        get_clusters()
+        get_clusters("2024-01-01", "2024-01-31", view_id="12345")
 
     with pytest.raises(ValueError, match="Authorization token is required"):
         get_budgets()
 
 @responses.activate
-def test_api_error_handling(cloudability_url, auth_token):
-    """Test API error handling."""
+def test_api_error_handling(cloudability_url, auth_token, monkeypatch):
+    """Test API error handling includes response body."""
+    monkeypatch.setenv("CLOUDABILITY_DEFAULT_VIEW_ID", "12345")
     responses.add(
         responses.POST,
         f"{cloudability_url}/containers/report",
@@ -270,7 +473,7 @@ def test_api_error_handling(cloudability_url, auth_token):
         status=400,
     )
 
-    with pytest.raises(Exception):  # requests.HTTPError
+    with pytest.raises(requests.HTTPError, match="response body"):
         get_containers_report(
             start_date="2024-01-01",
             end_date="2024-01-31",
@@ -293,7 +496,7 @@ def test_bearer_token_headers():
     
     assert headers["apptio-opentoken"] == "test-token"
     assert headers["apptio-environmentid"] == "test-env-id"
-    assert headers["Content-Type"] == "application/json"
+    assert "Content-Type" not in headers
 
 def test_basic_auth_headers():
     """Test Basic auth header generation."""
@@ -302,7 +505,7 @@ def test_basic_auth_headers():
     headers = get_auth_headers("Basic test-api-key:")
     
     assert headers["Authorization"] == "Basic test-api-key:"
-    assert headers["Content-Type"] == "application/json"
+    assert "Content-Type" not in headers
 
 def test_missing_environment_id_for_bearer():
     """Test that Bearer token without environment ID raises error."""
@@ -315,6 +518,195 @@ def test_missing_environment_id_for_bearer():
 
     with pytest.raises(ValueError, match="CLOUDABILITY_ENVIRONMENT_ID is required"):
         get_auth_headers("Bearer test-token")
+
+@responses.activate
+def test_fetch_apptio_opentoken_success():
+    """Test Frontdoor API key login returns apptio-opentoken."""
+    invalidate_opentoken_cache()
+    os.environ["CLOUDABILITY_KEY_ACCESS"] = "test-public-key"
+    os.environ["CLOUDABILITY_KEY_SECRET"] = "test-private-key"
+
+    responses.add(
+        responses.POST,
+        CLOUDABILITY_FRONTDOOR_URL,
+        json={"message": "login successful"},
+        headers={"apptio-opentoken": "frontdoor-token-123"},
+        status=200,
+    )
+
+    token = fetch_apptio_opentoken()
+    assert token == "frontdoor-token-123"
+
+    # Cached on second call while still valid
+    token2 = fetch_apptio_opentoken()
+    assert token2 == "frontdoor-token-123"
+    assert len(responses.calls) == 1
+
+    invalidate_opentoken_cache()
+    del os.environ["CLOUDABILITY_KEY_ACCESS"]
+    del os.environ["CLOUDABILITY_KEY_SECRET"]
+
+
+@responses.activate
+def test_fetch_apptio_opentoken_refreshes_when_expired():
+    """Test expired cache triggers a new Frontdoor login."""
+    import time
+
+    invalidate_opentoken_cache()
+    os.environ["CLOUDABILITY_KEY_ACCESS"] = "test-public-key"
+    os.environ["CLOUDABILITY_KEY_SECRET"] = "test-private-key"
+
+    responses.add(
+        responses.POST,
+        CLOUDABILITY_FRONTDOOR_URL,
+        json={"message": "login successful"},
+        headers={"apptio-opentoken": "initial-token"},
+        status=200,
+    )
+
+    assert fetch_apptio_opentoken() == "initial-token"
+    assert len(responses.calls) == 1
+
+    cloudability_tools._cached_opentoken = _OpentokenCacheEntry(
+        token="initial-token",
+        expires_at=time.time() - 1,
+    )
+
+    responses.add(
+        responses.POST,
+        CLOUDABILITY_FRONTDOOR_URL,
+        json={"message": "login successful"},
+        headers={"apptio-opentoken": "refreshed-token"},
+        status=200,
+    )
+
+    assert fetch_apptio_opentoken() == "refreshed-token"
+    assert len(responses.calls) == 2
+
+    invalidate_opentoken_cache()
+    del os.environ["CLOUDABILITY_KEY_ACCESS"]
+    del os.environ["CLOUDABILITY_KEY_SECRET"]
+
+
+@responses.activate
+def test_fetch_apptio_opentoken_from_cookie():
+    """Test Frontdoor login when token is only in Set-Cookie (not header)."""
+    import time
+    from email.utils import formatdate
+
+    invalidate_opentoken_cache()
+    os.environ["CLOUDABILITY_KEY_ACCESS"] = "test-public-key"
+    os.environ["CLOUDABILITY_KEY_SECRET"] = "test-private-key"
+
+    expires = int(time.time()) + 7200
+    expires_http = formatdate(expires, usegmt=True)
+    responses.add(
+        responses.POST,
+        CLOUDABILITY_FRONTDOOR_URL,
+        json={"message": "login successful"},
+        headers={
+            "Set-Cookie": (
+                f"apptio-opentoken=cookie-token; Path=/; Expires={expires_http}"
+            )
+        },
+        status=200,
+    )
+
+    token = fetch_apptio_opentoken()
+    assert token == "cookie-token"
+    assert cloudability_tools._cached_opentoken is not None
+    assert cloudability_tools._cached_opentoken.expires_at == float(expires)
+
+    invalidate_opentoken_cache()
+    del os.environ["CLOUDABILITY_KEY_ACCESS"]
+    del os.environ["CLOUDABILITY_KEY_SECRET"]
+
+
+@responses.activate
+def test_cloudability_request_retries_on_401_with_env_keys(cloudability_url):
+    """Test 401 from Cloudability API refreshes the cached opentoken and retries once."""
+    invalidate_opentoken_cache()
+    os.environ["CLOUDABILITY_KEY_ACCESS"] = "test-public-key"
+    os.environ["CLOUDABILITY_KEY_SECRET"] = "test-private-key"
+
+    responses.add(
+        responses.POST,
+        CLOUDABILITY_FRONTDOOR_URL,
+        json={"message": "login successful"},
+        headers={"apptio-opentoken": "stale-token"},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        f"{cloudability_url}/budgets",
+        status=401,
+    )
+    responses.add(
+        responses.POST,
+        CLOUDABILITY_FRONTDOOR_URL,
+        json={"message": "login successful"},
+        headers={"apptio-opentoken": "fresh-token"},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        f"{cloudability_url}/budgets",
+        json={"result": []},
+        status=200,
+    )
+
+    result = get_budgets()
+    assert "result" in result
+    budget_calls = [
+        c for c in responses.calls if c.request.url == f"{cloudability_url}/budgets"
+    ]
+    assert len(budget_calls) == 2
+    assert budget_calls[1].request.headers["apptio-opentoken"] == "fresh-token"
+
+    invalidate_opentoken_cache()
+    del os.environ["CLOUDABILITY_KEY_ACCESS"]
+    del os.environ["CLOUDABILITY_KEY_SECRET"]
+
+@responses.activate
+def test_resolve_authorization_from_env_keys(cloudability_url):
+    """Test API calls without authorization when env keys are configured."""
+
+    invalidate_opentoken_cache()
+    os.environ["CLOUDABILITY_KEY_ACCESS"] = "test-public-key"
+    os.environ["CLOUDABILITY_KEY_SECRET"] = "test-private-key"
+
+    responses.add(
+        responses.POST,
+        CLOUDABILITY_FRONTDOOR_URL,
+        json={"message": "login successful"},
+        headers={"apptio-opentoken": "env-token-456"},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        f"{cloudability_url}/budgets",
+        json={"result": []},
+        status=200,
+    )
+
+    result = get_budgets()
+    assert "result" in result
+    assert responses.calls[0].request.url == CLOUDABILITY_FRONTDOOR_URL
+    assert responses.calls[1].request.headers["apptio-opentoken"] == "env-token-456"
+
+    invalidate_opentoken_cache()
+    del os.environ["CLOUDABILITY_KEY_ACCESS"]
+    del os.environ["CLOUDABILITY_KEY_SECRET"]
+
+def test_resolve_authorization_explicit_over_env():
+    """Test explicit authorization is preferred over env keys."""
+    os.environ["CLOUDABILITY_KEY_ACCESS"] = "test-public-key"
+    os.environ["CLOUDABILITY_KEY_SECRET"] = "test-private-key"
+
+    assert resolve_authorization("Basic explicit:") == "Basic explicit:"
+
+    del os.environ["CLOUDABILITY_KEY_ACCESS"]
+    del os.environ["CLOUDABILITY_KEY_SECRET"]
 
 # ============================================================================
 # BUDGETS & FORECASTING API TESTS
@@ -335,17 +727,17 @@ def test_get_estimate_success(cloudability_url, basic_auth):
                 "cumulativeMtdSpend": [
                     {"date": "2024-01-01", "spend": 10418.50},
                     {"date": "2024-01-02", "spend": 14226.97}
+                ],
+                "details": [
+                    {
+                        "serviceName": "AWS EC2",
+                        "estimatedSpend": 54638.37,
+                        "mtdSpend": 23101.28,
+                        "previousMonthSpend": 56600.28,
+                        "usageFamily": "Instance Usage"
+                    }
                 ]
-            },
-            "details": [
-                {
-                    "serviceName": "AWS EC2",
-                    "estimatedSpend": 54638.37,
-                    "mtdSpend": 23101.28,
-                    "previousMonthSpend": 56600.28,
-                    "usageFamily": "Instance Usage"
-                }
-            ]
+            }
         },
         status=200,
     )
@@ -355,8 +747,45 @@ def test_get_estimate_success(cloudability_url, basic_auth):
     assert "result" in result
     assert result["result"]["estimatedSpend"] == 138429.32
     assert result["result"]["previousMonthFinalized"] is True
-    assert len(result["details"]) == 1
-    assert result["details"][0]["serviceName"] == "AWS EC2"
+    assert len(result["result"]["details"]) == 1
+    assert result["result"]["details"][0]["serviceName"] == "AWS EC2"
+
+
+@responses.activate
+def test_get_estimate_uses_default_view_id(
+    cloudability_url, basic_auth, monkeypatch
+):
+    """Omitted view_id should use CLOUDABILITY_DEFAULT_VIEW_ID when set."""
+    monkeypatch.setenv("CLOUDABILITY_DEFAULT_VIEW_ID", "12345")
+    responses.add(
+        responses.GET,
+        f"{cloudability_url}/estimate",
+        json={"result": {"estimatedSpend": 1.0}},
+        status=200,
+    )
+
+    get_estimate(authorization=basic_auth)
+
+    assert responses.calls[0].request.params["viewId"] == "12345"
+
+
+@responses.activate
+def test_get_estimate_explicit_zero_overrides_default(
+    cloudability_url, basic_auth, monkeypatch
+):
+    """Explicit view_id=\"0\" must not be replaced by CLOUDABILITY_DEFAULT_VIEW_ID."""
+    monkeypatch.setenv("CLOUDABILITY_DEFAULT_VIEW_ID", "12345")
+    responses.add(
+        responses.GET,
+        f"{cloudability_url}/estimate",
+        json={"result": {"estimatedSpend": 1.0}},
+        status=200,
+    )
+
+    get_estimate(view_id="0", authorization=basic_auth)
+
+    assert responses.calls[0].request.params["viewId"] == "0"
+
 
 @responses.activate
 def test_get_forecast_success(cloudability_url, basic_auth):
@@ -789,7 +1218,7 @@ def test_get_cost_measures_with_allocations(cloudability_url, basic_auth):
         status=200,
     )
 
-    result = get_cost_measures(apply_allocations=True, authorization=basic_auth)
+    get_cost_measures(apply_allocations=True, authorization=basic_auth)
 
     # Verify the parameter was passed correctly
     assert len(responses.calls) == 1
@@ -1007,7 +1436,7 @@ def test_get_report_results_with_token(cloudability_url, basic_auth):
         status=200,
     )
 
-    result = get_report_results(report_id=report_id, token=token, authorization=basic_auth)
+    get_report_results(report_id=report_id, token=token, authorization=basic_auth)
 
     # Verify the token was passed correctly
     assert len(responses.calls) == 1
@@ -1155,7 +1584,7 @@ def test_get_container_clusters_success(cloudability_url, basic_auth):
     """Test successful container clusters retrieval."""
     responses.add(
         responses.GET,
-        f"{cloudability_url}/containers/clusters",
+        f"{cloudability_url}/containers/v2/clusters",
         json={
             "result": {
                 "clusters": [
@@ -1190,7 +1619,8 @@ def test_get_container_clusters_success(cloudability_url, basic_auth):
     result = get_container_clusters(
         start_date="2018-11-01",
         end_date="2018-11-05",
-        authorization=basic_auth
+        view_id="12345",
+        authorization=basic_auth,
     )
 
     assert "result" in result
@@ -1198,77 +1628,6 @@ def test_get_container_clusters_success(cloudability_url, basic_auth):
     assert result["result"]["clusters"][0]["name"] == "cluster-aws"
     assert len(result["result"]["clusters"][0]["nodes"]) == 2
     assert result["result"]["meta"]["orgHasProvisioned"] is True
-
-@responses.activate
-def test_get_container_allocations_success(cloudability_url, basic_auth):
-    """Test successful container allocations analysis."""
-    responses.add(
-        responses.GET,
-        f"{cloudability_url}/containers/allocations",
-        json={
-            "result": {
-                "allocations": [
-                    {
-                        "dimensions": [
-                            {
-                                "key": "namespace",
-                                "value": "team-1"
-                            }
-                        ],
-                        "metrics": [
-                            {
-                                "key": "cpu/reserved",
-                                "allocation": 1,
-                                "resource": {
-                                    "mean": 674165746,
-                                    "unit": "microcpu"
-                                },
-                                "fairShare": 0.9998232082752361
-                            }
-                        ],
-                        "percentages": {
-                            "allocation": 0.6989469052842922,
-                            "fairShare": 0.9829955726607892
-                        },
-                        "costs": {
-                            "fairShare": 1292.67,
-                            "allocation": 919.14
-                        }
-                    }
-                ],
-                "unallocated": {
-                    "metrics": [
-                        {
-                            "key": "memory/reserved_rss",
-                            "allocation": 0.28594234634886845,
-                            "resource": {
-                                "mean": 58756565982,
-                                "unit": "bytes"
-                            }
-                        }
-                    ],
-                    "percentages": {
-                        "allocation": 0.29874400551866864
-                    },
-                    "cost": 392.86
-                }
-            }
-        },
-        status=200,
-    )
-
-    result = get_container_allocations(
-        start_date="2018-11-01",
-        end_date="2018-11-05",
-        group=["namespace"],
-        metrics=["cpu/reserved"],
-        authorization=basic_auth
-    )
-
-    assert "result" in result
-    assert len(result["result"]["allocations"]) == 1
-    assert result["result"]["allocations"][0]["dimensions"][0]["value"] == "team-1"
-    assert result["result"]["allocations"][0]["costs"]["allocation"] == 919.14
 
 @responses.activate
 def test_get_container_usage_success(cloudability_url, basic_auth):
@@ -1324,6 +1683,48 @@ def test_get_container_usage_success(cloudability_url, basic_auth):
     assert len(result["result"]["allocations"]) == 1
     assert len(result["result"]["allocations"][0]["metrics"][0]["allocation"]) == 3
 
+
+@responses.activate
+def test_get_container_usage_sends_default_view_id(
+    cloudability_url, basic_auth, monkeypatch
+):
+    """Test container usage includes viewId from CLOUDABILITY_DEFAULT_VIEW_ID."""
+    monkeypatch.setenv("CLOUDABILITY_DEFAULT_VIEW_ID", "12345")
+    responses.add(
+        responses.GET,
+        f"{cloudability_url}/containers/usage",
+        json={"result": {"allocations": []}},
+        status=200,
+    )
+
+    get_container_usage(
+        start_date="2018-11-01",
+        end_date="2018-11-05",
+        authorization=basic_auth,
+    )
+
+    assert responses.calls[0].request.url is not None
+    assert "viewId=12345" in responses.calls[0].request.url
+
+
+@responses.activate
+def test_list_provisioned_clusters_sends_default_view_id(
+    cloudability_url, basic_auth, monkeypatch
+):
+    """Test provisioning list includes viewId from CLOUDABILITY_DEFAULT_VIEW_ID."""
+    monkeypatch.setenv("CLOUDABILITY_DEFAULT_VIEW_ID", "12345")
+    responses.add(
+        responses.GET,
+        f"{cloudability_url}/containers/provisioning",
+        json={"result": []},
+        status=200,
+    )
+
+    list_provisioned_clusters(authorization=basic_auth)
+
+    assert "viewId=12345" in responses.calls[0].request.url
+
+
 @responses.activate
 def test_get_container_labels_success(cloudability_url, basic_auth):
     """Test successful container labels discovery."""
@@ -1363,52 +1764,6 @@ def test_get_container_labels_success(cloudability_url, basic_auth):
     assert result["result"]["labels"][0]["keyDisplay"] == "app"
     assert result["result"]["labels"][2]["keyDisplay"] == "team"
 
-@responses.activate
-def test_get_container_counts_success(cloudability_url, basic_auth):
-    """Test successful container counts retrieval."""
-    responses.add(
-        responses.GET,
-        f"{cloudability_url}/containers/counts",
-        json={
-            "result": {
-                "groups": [
-                    {
-                        "group": [
-                            {
-                                "key": "cluster",
-                                "value": "e5ad2c07-2bd4-4e8f-afdf-6dbbcddc8cea"
-                            }
-                        ],
-                        "counts": [
-                            {
-                                "key": "namespace",
-                                "value": 9
-                            },
-                            {
-                                "key": "service",
-                                "value": 18
-                            }
-                        ]
-                    }
-                ]
-            }
-        },
-        status=200,
-    )
-
-    result = get_container_counts(
-        start_date="2018-11-01",
-        end_date="2018-11-05",
-        dimensions=["namespace", "service"],
-        group=["cluster"],
-        authorization=basic_auth
-    )
-
-    assert "result" in result
-    assert len(result["result"]["groups"]) == 1
-    assert len(result["result"]["groups"][0]["counts"]) == 2
-    assert result["result"]["groups"][0]["counts"][0]["value"] == 9
-
 # ============================================================================
 # CONTAINER API ERROR TESTS
 # ============================================================================
@@ -1428,16 +1783,10 @@ def test_container_apis_missing_authorization():
         update_provisioned_cluster("1", kubernetes_version="1.26")
 
     with pytest.raises(ValueError, match="Authorization token is required"):
-        get_container_clusters("2023-01-01", "2023-01-31")
-
-    with pytest.raises(ValueError, match="Authorization token is required"):
-        get_container_allocations("2023-01-01", "2023-01-31")
+        get_container_clusters("2023-01-01", "2023-01-31", view_id="12345")
 
     with pytest.raises(ValueError, match="Authorization token is required"):
         get_container_usage("2023-01-01", "2023-01-31")
 
     with pytest.raises(ValueError, match="Authorization token is required"):
         get_container_labels("2023-01-01", "2023-01-31")
-
-    with pytest.raises(ValueError, match="Authorization token is required"):
-        get_container_counts("2023-01-01", "2023-01-31", ["namespace"])

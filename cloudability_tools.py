@@ -3,17 +3,254 @@ Cloudability API tools for MCP server.
 Comprehensive implementation of Cloudability API v3 endpoints.
 """
 
-import requests
+import contextlib
 import os
-from typing import Dict, List, Optional, Any
-from datetime import datetime
+import ssl
+import time
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
+from typing import Any, cast
+
+import requests
+import truststore
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
 
 load_dotenv()
 
-CLOUDABILITY_API_URL = os.getenv("CLOUDABILITY_API_URL", "https://api.cloudability.com/v3")
+# Refresh slightly before expiry so in-flight requests do not use a dying token.
+_OPENTOKEN_REFRESH_SKEW_SECONDS = 60
+_DEFAULT_OPENTOKEN_TTL_SECONDS = int(
+    os.getenv("CLOUDABILITY_OPENTOKEN_TTL_SECONDS", "3600")
+)
 
-def get_auth_headers(authorization: str) -> Dict[str, str]:
+
+class _TruststoreHTTPAdapter(HTTPAdapter):
+    """Use the OS certificate store (e.g. corporate CAs) for HTTPS requests."""
+
+    def init_poolmanager(
+        self,
+        connections: int,
+        maxsize: int,
+        block: bool = False,
+        **pool_kwargs: Any,
+    ) -> Any:
+        ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        return super().init_poolmanager(
+            connections, maxsize, block, ssl_context=ctx, **pool_kwargs
+        )
+
+
+@dataclass(frozen=True)
+class _OpentokenCacheEntry:
+    token: str
+    expires_at: float  # Unix timestamp (seconds)
+
+
+_cached_opentoken: _OpentokenCacheEntry | None = None
+
+
+def invalidate_opentoken_cache() -> None:
+    """Clear the cached Frontdoor apptio-opentoken (used by tests and 401 retry)."""
+    global _cached_opentoken
+    _cached_opentoken = None
+
+
+def _env_api_keys_configured() -> bool:
+    return bool(
+        os.getenv("CLOUDABILITY_KEY_ACCESS") and os.getenv("CLOUDABILITY_KEY_SECRET")
+    )
+
+
+def _expires_from_response(response: requests.Response) -> float:
+    """Derive token expiry from cookies, headers, or configured default TTL."""
+    for cookie in response.cookies:
+        if cookie.name == "apptio-opentoken" and cookie.expires is not None:
+            return float(cookie.expires)
+
+    for header_name in (
+        "apptio-opentoken-expires",
+        "apptio-token-expires",
+        "x-apptio-opentoken-expires",
+    ):
+        header_value = response.headers.get(header_name)
+        if not header_value:
+            continue
+        try:
+            return float(header_value)
+        except ValueError:
+            try:
+                return parsedate_to_datetime(header_value).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+    return time.time() + _DEFAULT_OPENTOKEN_TTL_SECONDS
+
+
+def _is_cache_valid(entry: _OpentokenCacheEntry) -> bool:
+    return time.time() < (entry.expires_at - _OPENTOKEN_REFRESH_SKEW_SECONDS)
+
+
+def _is_frontdoor_url(url: str) -> bool:
+    return url.startswith(CLOUDABILITY_FRONTDOOR_URL.rstrip("/"))
+
+
+def _should_retry_cloudability_auth(
+    url: str, headers: dict[str, str] | None, status_code: int
+) -> bool:
+    if status_code != 401:
+        return False
+    if _is_frontdoor_url(url):
+        return False
+    if not _env_api_keys_configured():
+        return False
+    return bool(headers and "apptio-opentoken" in headers)
+
+
+class _CloudabilitySession(requests.Session):
+    """HTTP session that refreshes env-sourced opentokens after 401 responses."""
+
+    def request(  # type: ignore[override]
+        self, method: str, url: str, **kwargs: Any
+    ) -> requests.Response:
+        response = super().request(method, url, **kwargs)
+        headers = kwargs.get("headers")
+        if not _should_retry_cloudability_auth(url, headers, response.status_code):
+            return response
+
+        invalidate_opentoken_cache()
+        new_authorization = resolve_authorization(None)
+        merged_headers = dict(headers or {})
+        merged_headers.update(get_auth_headers(new_authorization))
+        kwargs["headers"] = merged_headers
+        return super().request(method, url, **kwargs)
+
+
+_http_session = _CloudabilitySession()
+_http_session.mount("https://", _TruststoreHTTPAdapter())
+
+CLOUDABILITY_API_URL = os.getenv("CLOUDABILITY_API_URL", "https://api.cloudability.com/v3")
+CLOUDABILITY_FRONTDOOR_URL = os.getenv(
+    "CLOUDABILITY_FRONTDOOR_URL",
+    "https://frontdoor.apptio.com/service/apikeylogin",
+)
+
+
+def _response_json(response: requests.Response) -> dict[str, Any]:
+    return cast(dict[str, Any], response.json())
+
+
+def _raise_for_status_with_body(response: requests.Response) -> None:
+    """Raise HTTPError including the API response body when available."""
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = response.text.strip()
+        if detail:
+            with contextlib.suppress(ValueError):
+                detail = str(response.json())
+            raise requests.HTTPError(
+                f"{exc}; response body: {detail}",
+                response=response,
+            ) from exc
+        raise
+
+
+def _validate_containers_report_filters(filters: list[str] | None) -> None:
+    if not filters:
+        return
+    for filter_expr in filters:
+        if filter_expr.startswith("clusterName=="):
+            raise ValueError(
+                f'Invalid filter "{filter_expr}": cluster filters must use '
+                "cluster==<uuid> from list_clusters, not clusterName. "
+                "Example: cluster==0db407e4-e9e4-4fd1-bd2b-dea2c3585706"
+            )
+
+
+def _remap_containers_report_kpi(
+    widget_type: str,
+    group: list[str] | None,
+    filters: list[str] | None,
+) -> tuple[str, list[str] | None, bool]:
+    """Translate kpi to top because the Cloudability API returns HTTP 400 for kpi."""
+    if widget_type != "kpi":
+        return widget_type, group, False
+
+    remapped_group = group
+    if not group and filters and any(
+        filter_expr.startswith("cluster==") for filter_expr in filters
+    ):
+        remapped_group = ["cluster"]
+    return "top", remapped_group, True
+
+
+def fetch_apptio_opentoken(force_refresh: bool = False) -> str:
+    """Exchange Frontdoor API keys for an apptio-opentoken."""
+    global _cached_opentoken
+
+    if (
+        not force_refresh
+        and _cached_opentoken is not None
+        and _is_cache_valid(_cached_opentoken)
+    ):
+        return _cached_opentoken.token
+
+    key_access = os.getenv("CLOUDABILITY_KEY_ACCESS")
+    key_secret = os.getenv("CLOUDABILITY_KEY_SECRET")
+    if not key_access or not key_secret:
+        raise ValueError(
+            "CLOUDABILITY_KEY_ACCESS and CLOUDABILITY_KEY_SECRET are required "
+            "to obtain an apptio-opentoken"
+        )
+
+    response = _http_session.post(
+        CLOUDABILITY_FRONTDOOR_URL,
+        json={"keyAccess": key_access, "keySecret": key_secret},
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    response.raise_for_status()
+
+    token = response.headers.get("apptio-opentoken")
+    if not token:
+        token = response.cookies.get("apptio-opentoken")
+    if not token:
+        try:
+            body = response.json()
+            token = body.get("token") or body.get("apptio-opentoken")
+        except ValueError:
+            pass
+
+    if not token:
+        raise ValueError("Failed to obtain apptio-opentoken from Frontdoor login")
+
+    _cached_opentoken = _OpentokenCacheEntry(
+        token=token,
+        expires_at=_expires_from_response(response),
+    )
+    return token
+
+
+def resolve_authorization(authorization: str | None) -> str:
+    """Resolve authorization from an explicit value or env-based API keys."""
+    if authorization:
+        return authorization
+
+    key_access = os.getenv("CLOUDABILITY_KEY_ACCESS")
+    key_secret = os.getenv("CLOUDABILITY_KEY_SECRET")
+    if key_access and key_secret:
+        return f"Bearer {fetch_apptio_opentoken()}"
+
+    raise ValueError(
+        "Authorization token is required. Provide authorization or set "
+        "CLOUDABILITY_KEY_ACCESS and CLOUDABILITY_KEY_SECRET environment variables."
+    )
+
+
+def get_auth_headers(authorization: str) -> dict[str, str]:
     """Get authentication headers for Cloudability API."""
     if not authorization:
         raise ValueError("Authorization token is required")
@@ -28,15 +265,13 @@ def get_auth_headers(authorization: str) -> Dict[str, str]:
         return {
             "apptio-opentoken": token,
             "apptio-environmentid": env_id,
-            "Content-Type": "application/json",
-            "Accept": "application/json"
+            "Accept": "application/json",
         }
     else:
         # Basic Auth with API key
         return {
             "Authorization": authorization,
-            "Content-Type": "application/json",
-            "Accept": "application/json"
+            "Accept": "application/json",
         }
 
 # ============================================================================
@@ -49,7 +284,7 @@ def provision_cluster(
     kubernetes_version: str | None = None,
     cluster_version: str | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Provision a new Kubernetes cluster for Cloudability monitoring.
 
@@ -65,8 +300,7 @@ def provision_cluster(
     Returns:
         Provisioned cluster object with ID and configuration details
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     if not kubernetes_version and not cluster_version:
         raise ValueError("Either kubernetes_version or cluster_version is required")
@@ -77,15 +311,15 @@ def provision_cluster(
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/containers/provisioning"
 
-    data = {"clusterName": cluster_name}
+    data: dict[str, Any] = {"clusterName": cluster_name}
     if kubernetes_version:
         data["kubernetesVersion"] = kubernetes_version
     if cluster_version:
         data["clusterVersion"] = cluster_version
 
-    response = requests.post(url, json=data, headers=headers)
+    response = _http_session.post(url, json=data, headers=headers)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 def get_cluster_deployment_config(
     cluster_id: str,
@@ -101,42 +335,46 @@ def get_cluster_deployment_config(
     Returns:
         Kubernetes deployment YAML as string
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/containers/provisioning/{cluster_id}/config"
 
-    response = requests.get(url, headers=headers)
+    response = _http_session.get(url, headers=headers)
     response.raise_for_status()
     return response.text
 
-def list_provisioned_clusters(authorization: str | None = None) -> Dict[str, Any]:
+def list_provisioned_clusters(
+    view_id: str | None = None,
+    authorization: str | None = None,
+) -> dict[str, Any]:
     """
     Get list of all provisioned clusters.
 
     Args:
+        view_id: Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted)
         authorization: Bearer token or Basic auth header
 
     Returns:
         List of provisioned clusters with their configurations
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/containers/provisioning"
+    params: dict[str, Any] = {}
+    _apply_view_id_param(params, view_id)
 
-    response = requests.get(url, headers=headers)
+    response = _http_session.get(url, headers=headers, params=params or None)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 def update_provisioned_cluster(
     cluster_id: str,
     kubernetes_version: str | None = None,
     cluster_version: str | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Update a provisioned cluster configuration.
 
@@ -151,8 +389,7 @@ def update_provisioned_cluster(
 
     Note: Currently requires ALL fields to be provided (PATCH support coming)
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     if not kubernetes_version and not cluster_version:
         raise ValueError("Either kubernetes_version or cluster_version is required")
@@ -160,165 +397,181 @@ def update_provisioned_cluster(
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/containers/provisioning/{cluster_id}"
 
-    data = {}
+    data: dict[str, Any] = {}
     if kubernetes_version:
         data["kubernetesVersion"] = kubernetes_version
     if cluster_version:
         data["clusterVersion"] = cluster_version
 
-    response = requests.put(url, json=data, headers=headers)
+    response = _http_session.put(url, json=data, headers=headers)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
-# Enhanced Clusters API
+# Enhanced Clusters API (v2)
+def _resolve_view_id(view_id: str | None) -> str:
+    if view_id is not None:
+        return view_id
+    default = os.getenv("CLOUDABILITY_DEFAULT_VIEW_ID")
+    if default:
+        return default
+    raise ValueError(
+        "view_id is required. Pass view_id or set CLOUDABILITY_DEFAULT_VIEW_ID."
+    )
+
+
+def _resolve_estimate_view_id(view_id: str | None) -> str:
+    """Resolve viewId for /estimate and /forecast.
+
+    When view_id is omitted, uses CLOUDABILITY_DEFAULT_VIEW_ID if set;
+    otherwise falls back to \"0\" (all org cost data). Pass view_id=\"0\"
+    explicitly to request org-wide data when a default view is configured.
+    """
+    if view_id is not None:
+        return view_id
+    default = os.getenv("CLOUDABILITY_DEFAULT_VIEW_ID")
+    if default:
+        return default
+    return "0"
+
+
+def _apply_view_id_param(params: dict[str, Any], view_id: str | None) -> None:
+    """Attach viewId to container API query params when a view is known."""
+    resolved = view_id if view_id is not None else os.getenv("CLOUDABILITY_DEFAULT_VIEW_ID")
+    if resolved:
+        params["viewId"] = resolved
+
+
 def get_container_clusters(
     start_date: str,
     end_date: str,
-    authorization: str | None = None
-) -> Dict[str, Any]:
+    view_id: str | None = None,
+    concise: bool = False,
+    authorization: str | None = None,
+) -> dict[str, Any]:
     """
     Get detailed information about clusters and their nodes.
 
     Args:
         start_date: Start date for cluster data window (YYYY-MM-DD)
         end_date: End date for cluster data window (YYYY-MM-DD)
+        view_id: Cloudability view ID (required unless CLOUDABILITY_DEFAULT_VIEW_ID is set)
+        concise: When True, omit per-node details from the response
         authorization: Bearer token or Basic auth header
 
     Returns:
         Detailed cluster information with nodes, timestamps, and metadata
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    return get_clusters(
+        start_date=start_date,
+        end_date=end_date,
+        view_id=view_id,
+        concise=concise,
+        authorization=authorization,
+    )
+
+
+def get_clusters(
+    start_date: str,
+    end_date: str,
+    view_id: str | None = None,
+    concise: bool = True,
+    authorization: str | None = None,
+) -> dict[str, Any]:
+    """Get Kubernetes clusters from the Cloudability containers v2 API."""
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
-    url = f"{CLOUDABILITY_API_URL}/containers/clusters"
+    url = f"{CLOUDABILITY_API_URL}/containers/v2/clusters"
 
-    params = {
+    params: dict[str, Any] = {
         "start": start_date,
-        "end": end_date
+        "end": end_date,
+        "viewId": _resolve_view_id(view_id),
+        "concise": str(concise).lower(),
     }
 
-    response = requests.get(url, headers=headers, params=params)
+    response = _http_session.get(url, headers=headers, params=params)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
+
 
 def get_containers_report(
     start_date: str,
     end_date: str,
     cost_type: str = "adjusted",
-    metrics: List[str] | None = None,
-    group: List[str] | None = None,
-    filters: List[str] | None = None,
+    metrics: list[str] | None = None,
+    group: list[str] | None = None,
+    count: list[str] | None = None,
+    filters: list[str] | None = None,
     widget_type: str = "top",
     limit: int = 50,
-    sort: List[Dict[str, str]] | None = None,
-    view_id: Optional[str] = None,
+    sort: list[dict[str, str]] | None = None,
+    view_id: str | None = None,
+    pagination_token: str | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Get containers cost and usage report from Cloudability.
-    
-    This is the main containers reporting endpoint that provides detailed
-    cost and usage analytics for Kubernetes workloads.
+
+    view_id is required unless CLOUDABILITY_DEFAULT_VIEW_ID is set.
+
+    total_cost is fairshare-allocated workload cost, not billing/invoiced cost.
+    Use run_cost_report (execute_cost_report) for unblended_cost, idle overhead,
+    and amortized billing metrics.
+
+    widget_type kpi is remapped to top because the API returns HTTP 400 for kpi.
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
-    
+    authorization = resolve_authorization(authorization)
+
+    _validate_containers_report_filters(filters)
+    widget_type, group, kpi_remapped = _remap_containers_report_kpi(
+        widget_type, group, filters
+    )
+
     headers = get_auth_headers(authorization)
-    
-    # Default metrics if none provided
+
     if metrics is None:
         metrics = ["total_cost", "total_cost_efficiency"]
-    
-    # Build request body
-    request_body = {
+
+    request_body: dict[str, Any] = {
         "start": start_date,
         "end": end_date,
         "costType": cost_type,
         "metrics": metrics,
         "widgetType": widget_type,
-        "limit": limit
+        "limit": limit,
     }
-    
-    # Add optional parameters
+
     if group:
         request_body["group"] = group
+    if count:
+        request_body["count"] = count
     if filters:
         request_body["filters"] = filters
     if sort:
         request_body["sort"] = sort
-    
-    # Build URL with optional view_id
+    if pagination_token:
+        request_body["paginationToken"] = pagination_token
+
     url = f"{CLOUDABILITY_API_URL}/containers/report"
-    params = {}
-    if view_id:
-        params["viewId"] = view_id
-    
-    response = requests.post(url, json=request_body, headers=headers, params=params)
-    response.raise_for_status()
-    return response.json()
+    params = {"viewId": _resolve_view_id(view_id)}
 
-# Container Allocations API
-def get_container_allocations(
-    start_date: str,
-    end_date: str,
-    group: List[str] | None = None,
-    metrics: List[str] | None = None,
-    filters: List[str] | None = None,
-    cost_type: str = "adjusted_cost",
-    authorization: str | None = None
-) -> Dict[str, Any]:
-    """
-    Get container cost allocations broken down by specified groupings.
-
-    This analyzes cluster usage, determines resource allocation percentages,
-    and divides costs based on actual usage patterns.
-
-    Args:
-        start_date: Start date (YYYY-MM-DD)
-        end_date: End date (YYYY-MM-DD)
-        group: Grouping dimensions (e.g., ["namespace", "service"])
-        metrics: Metrics to calculate (e.g., ["cpu/reserved", "memory/reserved_rss"])
-        filters: Filter expressions (e.g., ["cluster==uuid", "namespace==production"])
-        cost_type: Cost basis - "adjusted_cost", "adjusted_amortized_cost", or empty
-        authorization: Bearer token or Basic auth header
-
-    Returns:
-        Detailed allocation data with costs, percentages, and resource usage
-    """
-    if not authorization:
-        raise ValueError("Authorization token is required")
-
-    headers = get_auth_headers(authorization)
-    url = f"{CLOUDABILITY_API_URL}/containers/allocations"
-
-    params = {
-        "start": start_date,
-        "end": end_date
-    }
-
-    if group:
-        params["group"] = ",".join(group)
-    if metrics:
-        params["metrics"] = ",".join(metrics)
-    if filters:
-        for filter_expr in filters:
-            params.setdefault("filters", []).append(filter_expr)
-    if cost_type:
-        params["costType"] = cost_type
-
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()
-    return response.json()
+    response = _http_session.post(url, json=request_body, headers=headers, params=params)
+    _raise_for_status_with_body(response)
+    result = _response_json(response)
+    if kpi_remapped:
+        result["_kpi_remapped_to_top"] = True
+    return result
 
 # Container Usage API
 def get_container_usage(
     start_date: str,
     end_date: str,
-    metrics: List[str] | None = None,
-    filters: List[str] | None = None,
-    authorization: str | None = None
-) -> Dict[str, Any]:
+    metrics: list[str] | None = None,
+    filters: list[str] | None = None,
+    view_id: str | None = None,
+    authorization: str | None = None,
+) -> dict[str, Any]:
     """
     Get daily resource usage data for containers.
 
@@ -330,21 +583,22 @@ def get_container_usage(
         end_date: End date (YYYY-MM-DD)
         metrics: Metrics to report (e.g., ["cpu/reserved", "filesystem/usage"])
         filters: Filter expressions to scope the data
+        view_id: Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted)
         authorization: Bearer token or Basic auth header
 
     Returns:
         Daily usage data with allocation percentages and resource values
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/containers/usage"
 
-    params = {
+    params: dict[str, Any] = {
         "start": start_date,
-        "end": end_date
+        "end": end_date,
     }
+    _apply_view_id_param(params, view_id)
 
     if metrics:
         params["metrics"] = ",".join(metrics)
@@ -352,17 +606,18 @@ def get_container_usage(
         for filter_expr in filters:
             params.setdefault("filters", []).append(filter_expr)
 
-    response = requests.get(url, headers=headers, params=params)
+    response = _http_session.get(url, headers=headers, params=params)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 # Container Labels API
 def get_container_labels(
     start_date: str,
     end_date: str,
-    filters: List[str] | None = None,
-    authorization: str | None = None
-) -> Dict[str, Any]:
+    filters: list[str] | None = None,
+    view_id: str | None = None,
+    authorization: str | None = None,
+) -> dict[str, Any]:
     """
     Get list of Kubernetes label keys observed in the specified timeframe.
 
@@ -370,167 +625,139 @@ def get_container_labels(
         start_date: Start date (YYYY-MM-DD)
         end_date: End date (YYYY-MM-DD)
         filters: Filter expressions to scope the data
+        view_id: Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted)
         authorization: Bearer token or Basic auth header
 
     Returns:
         List of label keys with their display names
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/containers/labels"
 
-    params = {
-        "start": start_date,
-        "end": end_date
-    }
-
-    if filters:
-        for filter_expr in filters:
-            params.setdefault("filters", []).append(filter_expr)
-
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()
-    return response.json()
-
-# Container Counts API
-def get_container_counts(
-    start_date: str,
-    end_date: str,
-    dimensions: List[str],
-    group: List[str] | None = None,
-    filters: List[str] | None = None,
-    authorization: str | None = None
-) -> Dict[str, Any]:
-    """
-    Get counts of distinct values for dimension keys.
-
-    Args:
-        start_date: Start date (YYYY-MM-DD)
-        end_date: End date (YYYY-MM-DD)
-        dimensions: Dimensions to count (e.g., ["namespace", "service"])
-        group: Group results by dimensions (e.g., ["cluster"])
-        filters: Filter expressions to scope the data
-        authorization: Bearer token or Basic auth header
-
-    Returns:
-        Counts of distinct values grouped by specified dimensions
-    """
-    if not authorization:
-        raise ValueError("Authorization token is required")
-
-    headers = get_auth_headers(authorization)
-    url = f"{CLOUDABILITY_API_URL}/containers/counts"
-
-    params = {
+    params: dict[str, Any] = {
         "start": start_date,
         "end": end_date,
-        "dimensions": ",".join(dimensions)
     }
+    _apply_view_id_param(params, view_id)
 
-    if group:
-        params["group"] = ",".join(group)
     if filters:
         for filter_expr in filters:
             params.setdefault("filters", []).append(filter_expr)
 
-    response = requests.get(url, headers=headers, params=params)
+    response = _http_session.get(url, headers=headers, params=params)
     response.raise_for_status()
-    return response.json()
-
-def get_clusters(authorization: str | None = None) -> Dict[str, Any]:
-    """Get list of all clusters."""
-    if not authorization:
-        raise ValueError("Authorization token is required")
-    
-    headers = get_auth_headers(authorization)
-    url = f"{CLOUDABILITY_API_URL}/containers/clusters"
-    
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 # ============================================================================
 # BUDGETS API
 # ============================================================================
 
-def get_budgets(authorization: str | None = None) -> Dict[str, Any]:
+def get_budgets(authorization: str | None = None) -> dict[str, Any]:
     """Get list of all budgets."""
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/budgets"
 
-    response = requests.get(url, headers=headers)
+    response = _http_session.get(url, headers=headers)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
-def get_budget_details(budget_id: str, authorization: str | None = None) -> Dict[str, Any]:
+def get_budget_details(budget_id: str, authorization: str | None = None) -> dict[str, Any]:
     """Get details for a specific budget."""
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
     
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/budgets/{budget_id}"
     
-    response = requests.get(url, headers=headers)
+    response = _http_session.get(url, headers=headers)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 # ============================================================================
-# BILLING ACCOUNTS API
+# VENDOR ACCOUNTS API
 # ============================================================================
 
-def get_billing_accounts(authorization: str | None = None) -> Dict[str, Any]:
-    """Get list of billing accounts."""
-    if not authorization:
-        raise ValueError("Authorization token is required")
-    
+# Cloudability uses mixed casing in vendor path segments (e.g. AWS vs azure).
+_VENDOR_ACCOUNT_SEGMENTS: dict[str, str] = {
+    "aws": "AWS",
+    "azure": "azure",
+    "gcp": "gcp",
+    "ibm": "ibm",
+    "oci": "oci",
+}
+
+
+def get_vendor_accounts(
+    vendor: str,
+    view_id: str | None = None,
+    authorization: str | None = None,
+) -> dict[str, Any]:
+    """
+    Get list of cloud vendor credential accounts from Cloudability.
+
+    Args:
+        vendor: Vendor key (aws, azure, gcp, ibm, oci)
+        view_id: Cloudability view ID (defaults to \"0\" for all org accounts)
+        authorization: Bearer token or Basic auth header
+
+    Returns:
+        Cloudability v3 envelope with vendor credential accounts under ``result``
+    """
+    authorization = resolve_authorization(authorization)
+
+    segment = _VENDOR_ACCOUNT_SEGMENTS.get(vendor.lower())
+    if not segment:
+        supported = ", ".join(sorted(_VENDOR_ACCOUNT_SEGMENTS))
+        raise ValueError(f"Unsupported vendor {vendor!r}. Supported: {supported}")
+
     headers = get_auth_headers(authorization)
-    url = f"{CLOUDABILITY_API_URL}/billing-accounts"
-    
-    response = requests.get(url, headers=headers)
+    url = f"{CLOUDABILITY_API_URL}/vendors/{segment}/accounts"
+    params: dict[str, Any] = {"viewId": view_id if view_id is not None else "0"}
+
+    response = _http_session.get(url, headers=headers, params=params)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 # ============================================================================
 # BUDGETS & FORECASTING API
 # ============================================================================
 
 def get_estimate(
-    view_id: str = "0",
+    view_id: str | None = None,
     basis: str = "cash",
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Generate a spending estimate for the current month.
 
     Args:
-        view_id: The view ID to generate estimate for (0 = all cost data)
+        view_id: View ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted; \"0\" = all cost data)
         basis: Cost basis - "cash", "amortized", "adjusted", "adjustedAmortized", "list"
         authorization: Bearer token or Basic auth header
 
     Returns:
-        Estimate object with current month projections and spending drivers
+        Cloudability v3 envelope ``{"result": {...}}`` where ``result`` contains
+        ``estimatedSpend``, ``previousMonthSpend``, ``cumulativeMtdSpend``, and
+        ``details`` (service-level spending drivers).
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
-    params = {
-        "viewId": view_id,
+    params: dict[str, Any] = {
+        "viewId": _resolve_estimate_view_id(view_id),
         "basis": basis
     }
 
     url = f"{CLOUDABILITY_API_URL}/estimate"
-    response = requests.get(url, headers=headers, params=params)
+    response = _http_session.get(url, headers=headers, params=params)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 def get_forecast(
-    view_id: str = "0",
+    view_id: str | None = None,
     basis: str = "cash",
     months_back: int = 6,
     months_forward: int = 12,
@@ -538,12 +765,12 @@ def get_forecast(
     remove_credits: bool = False,
     remove_one_time_charges: bool = False,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Generate a spending forecast for future months.
 
     Args:
-        view_id: The view ID to generate forecast for (0 = all cost data)
+        view_id: View ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted; \"0\" = all cost data)
         basis: Cost basis - "cash", "amortized", "adjusted", "adjustedAmortized", "list"
         months_back: Months of history to use (3-24)
         months_forward: Months to forecast (1-24)
@@ -553,10 +780,10 @@ def get_forecast(
         authorization: Bearer token or Basic auth header
 
     Returns:
-        Forecast object with projected spending and historical comparison
+        Cloudability v3 envelope ``{"result": {...}}`` with forecast, actual,
+        and detail arrays nested under ``result``.
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     # Validate parameters
     if not (3 <= months_back <= 24):
@@ -565,8 +792,8 @@ def get_forecast(
         raise ValueError("months_forward must be between 1 and 24")
 
     headers = get_auth_headers(authorization)
-    params = {
-        "viewId": view_id,
+    params: dict[str, Any] = {
+        "viewId": _resolve_estimate_view_id(view_id),
         "basis": basis,
         "monthsBack": months_back,
         "monthsForward": months_forward,
@@ -576,17 +803,17 @@ def get_forecast(
     }
 
     url = f"{CLOUDABILITY_API_URL}/forecast"
-    response = requests.get(url, headers=headers, params=params)
+    response = _http_session.get(url, headers=headers, params=params)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 def create_budget(
     name: str,
     basis: str,
     view_id: str = "0",
-    months: List[Dict[str, Any]] | None = None,
+    months: list[dict[str, Any]] | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Create a new budget.
 
@@ -600,12 +827,11 @@ def create_budget(
     Returns:
         Created budget object
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
 
-    budget_data = {
+    budget_data: dict[str, Any] = {
         "name": name,
         "basis": basis,
         "viewId": view_id,
@@ -613,18 +839,18 @@ def create_budget(
     }
 
     url = f"{CLOUDABILITY_API_URL}/budgets"
-    response = requests.post(url, json=budget_data, headers=headers)
+    response = _http_session.post(url, json=budget_data, headers=headers)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 def update_budget(
     budget_id: str,
     name: str | None = None,
     basis: str | None = None,
     view_id: str | None = None,
-    months: List[Dict[str, Any]] | None = None,
+    months: list[dict[str, Any]] | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Update an existing budget.
 
@@ -639,13 +865,12 @@ def update_budget(
     Returns:
         Updated budget object
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
 
     # Build update data with only provided fields
-    budget_data = {}
+    budget_data: dict[str, Any] = {}
     if name is not None:
         budget_data["name"] = name
     if basis is not None:
@@ -656,9 +881,9 @@ def update_budget(
         budget_data["months"] = months
 
     url = f"{CLOUDABILITY_API_URL}/budgets/{budget_id}"
-    response = requests.put(url, json=budget_data, headers=headers)
+    response = _http_session.put(url, json=budget_data, headers=headers)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 def delete_budget(budget_id: str, authorization: str | None = None) -> bool:
     """
@@ -671,13 +896,12 @@ def delete_budget(budget_id: str, authorization: str | None = None) -> bool:
     Returns:
         True if deletion was successful
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/budgets/{budget_id}"
 
-    response = requests.delete(url, headers=headers)
+    response = _http_session.delete(url, headers=headers)
     response.raise_for_status()
     return True
 
@@ -686,7 +910,7 @@ def create_budget_subscription(
     notify_exceeded: bool = False,
     notify_expected: bool = False,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Create a budget subscription for email notifications.
 
@@ -699,26 +923,25 @@ def create_budget_subscription(
     Returns:
         Created subscription object
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
 
-    subscription_data = {
+    subscription_data: dict[str, Any] = {
         "budgetId": budget_id,
         "notifyExceeded": notify_exceeded,
         "notifyExpected": notify_expected
     }
 
     url = f"{CLOUDABILITY_API_URL}/budget-subscriptions"
-    response = requests.post(url, json=subscription_data, headers=headers)
+    response = _http_session.post(url, json=subscription_data, headers=headers)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 def get_budget_subscription(
     subscription_id: str,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Get a specific budget subscription.
 
@@ -729,17 +952,16 @@ def get_budget_subscription(
     Returns:
         Budget subscription object
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/budget-subscriptions/{subscription_id}"
 
-    response = requests.get(url, headers=headers)
+    response = _http_session.get(url, headers=headers)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
-def list_budget_subscriptions(authorization: str | None = None) -> Dict[str, Any]:
+def list_budget_subscriptions(authorization: str | None = None) -> dict[str, Any]:
     """
     Get list of all budget subscriptions.
 
@@ -749,15 +971,14 @@ def list_budget_subscriptions(authorization: str | None = None) -> Dict[str, Any
     Returns:
         List of budget subscription objects
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/budget-subscriptions"
 
-    response = requests.get(url, headers=headers)
+    response = _http_session.get(url, headers=headers)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 def update_budget_subscription(
     subscription_id: str,
@@ -765,7 +986,7 @@ def update_budget_subscription(
     notify_exceeded: bool | None = None,
     notify_expected: bool | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Update a budget subscription.
 
@@ -779,13 +1000,12 @@ def update_budget_subscription(
     Returns:
         Updated subscription object
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
 
     # Build update data with only provided fields
-    subscription_data = {}
+    subscription_data: dict[str, Any] = {}
     if budget_id is not None:
         subscription_data["budgetId"] = budget_id
     if notify_exceeded is not None:
@@ -794,9 +1014,9 @@ def update_budget_subscription(
         subscription_data["notifyExpected"] = notify_expected
 
     url = f"{CLOUDABILITY_API_URL}/budget-subscriptions/{subscription_id}"
-    response = requests.put(url, json=subscription_data, headers=headers)
+    response = _http_session.put(url, json=subscription_data, headers=headers)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 def delete_budget_subscription(
     subscription_id: str,
@@ -812,13 +1032,12 @@ def delete_budget_subscription(
     Returns:
         True if deletion was successful
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/budget-subscriptions/{subscription_id}"
 
-    response = requests.delete(url, headers=headers)
+    response = _http_session.delete(url, headers=headers)
     response.raise_for_status()
     return True
 
@@ -826,7 +1045,7 @@ def delete_budget_subscription(
 # COST REPORTING API
 # ============================================================================
 
-def list_cost_reports(authorization: str | None = None) -> Dict[str, Any]:
+def list_cost_reports(authorization: str | None = None) -> dict[str, Any]:
     """
     Get list of saved cost reports owned by or shared with the user/org.
 
@@ -836,20 +1055,19 @@ def list_cost_reports(authorization: str | None = None) -> Dict[str, Any]:
     Returns:
         List of cost report objects with metadata and configurations
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/reporting/reports/cost"
 
-    response = requests.get(url, headers=headers)
+    response = _http_session.get(url, headers=headers)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 def get_cost_measures(
     apply_allocations: bool | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Get list of available cost reporting measures (dimensions and metrics).
 
@@ -860,21 +1078,20 @@ def get_cost_measures(
     Returns:
         List of available measures with metadata (dimensions and metrics)
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/reporting/cost/measures"
 
-    params = {}
+    params: dict[str, Any] = {}
     if apply_allocations is not None:
         params["apply_allocations"] = str(apply_allocations).lower()
 
-    response = requests.get(url, headers=headers, params=params)
+    response = _http_session.get(url, headers=headers, params=params)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
-def get_cost_filter_operators(authorization: str | None = None) -> Dict[str, Any]:
+def get_cost_filter_operators(authorization: str | None = None) -> dict[str, Any]:
     """
     Get list of available filter operators for cost reporting.
 
@@ -884,23 +1101,44 @@ def get_cost_filter_operators(authorization: str | None = None) -> Dict[str, Any
     Returns:
         List of filter operators (==, !=, >, <, =@, etc.)
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/reporting/cost/filters"
 
-    response = requests.get(url, headers=headers)
+    response = _http_session.get(url, headers=headers)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
+
+def _apply_sort(params: dict[str, Any], sort: list[str] | None) -> None:
+    """Map a sort expression to the params Cloudability actually accepts.
+
+    The /reporting/cost/run endpoint expects ``sort_by=<field>`` plus an
+    optional ``order=asc|desc``. Sending ``sort=<field>`` returns
+    HTTP 422 "Invalid sort direction". Accept the documented
+    ``"<field>ASC"`` / ``"<field>DESC"`` expression form (or a bare field
+    name) and split it; order defaults to ``desc``.
+    """
+    if not sort:
+        return
+    expr = sort[0].strip()
+    order = "desc"
+    upper = expr.upper()
+    if upper.endswith("ASC"):
+        expr, order = expr[:-3], "asc"
+    elif upper.endswith("DESC"):
+        expr, order = expr[:-4], "desc"
+    params["sort_by"] = expr
+    params["order"] = order
+
 
 def run_cost_report(
     start_date: str,
     end_date: str,
-    dimensions: List[str],
-    metrics: List[str],
-    filters: List[str] | None = None,
-    sort: List[str] | None = None,
+    dimensions: list[str],
+    metrics: list[str],
+    filters: list[str] | None = None,
+    sort: list[str] | None = None,
     limit: int | None = None,
     offset: int | None = None,
     chart: bool = False,
@@ -908,7 +1146,7 @@ def run_cost_report(
     apply_allocations: bool | None = None,
     token: str | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Execute a cost report with flexible filtering, sorting, and pagination.
 
@@ -918,7 +1156,9 @@ def run_cost_report(
         dimensions: List of dimensions (max 15, e.g., ["vendor", "region"])
         metrics: List of metrics (max 8, e.g., ["total_amortized_cost", "usage_hours"])
         filters: List of filter expressions (e.g., ["transaction_type==usage"])
-        sort: List of sort expressions (e.g., ["total_amortized_costASC", "regionDESC"])
+        sort: Sort expression as ["<field>"] or ["<field>ASC"]/["<field>DESC"]
+            (order defaults to desc), e.g. ["total_amortized_costDESC"].
+            Sent to the API as sort_by + order.
         limit: Maximum rows to return (default 10000, set 0 for 64000)
         offset: Starting position for results
         chart: Format data for chart purposes (based on dates)
@@ -930,8 +1170,7 @@ def run_cost_report(
     Returns:
         Cost report object with results, metadata, and pagination info
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     # Validate limits
     if len(dimensions) > 15:
@@ -942,7 +1181,7 @@ def run_cost_report(
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/reporting/cost/run"
 
-    params = {
+    params: dict[str, Any] = {
         "start_date": start_date,
         "end_date": end_date,
         "dimensions": ",".join(dimensions),
@@ -953,8 +1192,7 @@ def run_cost_report(
     if filters:
         for filter_expr in filters:
             params.setdefault("filters", []).append(filter_expr)
-    if sort:
-        params["sort"] = ",".join(sort)
+    _apply_sort(params, sort)
     if limit is not None:
         params["limit"] = limit
     if offset is not None:
@@ -968,24 +1206,24 @@ def run_cost_report(
     if token:
         params["token"] = token
 
-    response = requests.get(url, headers=headers, params=params)
+    response = _http_session.get(url, headers=headers, params=params)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 def enqueue_cost_report(
     start_date: str,
     end_date: str,
-    dimensions: List[str],
-    metrics: List[str],
-    filters: List[str] | None = None,
-    sort: List[str] | None = None,
+    dimensions: list[str],
+    metrics: list[str],
+    filters: list[str] | None = None,
+    sort: list[str] | None = None,
     limit: int | None = None,
     offset: int | None = None,
     chart: bool = False,
     view_id: str | None = None,
     apply_allocations: bool | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Enqueue a cost report for asynchronous processing.
 
@@ -998,7 +1236,8 @@ def enqueue_cost_report(
         dimensions: List of dimensions (max 15)
         metrics: List of metrics (max 8)
         filters: List of filter expressions
-        sort: List of sort expressions
+        sort: Sort expression as ["<field>"] or ["<field>ASC"]/["<field>DESC"]
+            (order defaults to desc); sent to the API as sort_by + order
         limit: Maximum rows to return
         offset: Starting position for results
         chart: Format data for chart purposes
@@ -1011,8 +1250,7 @@ def enqueue_cost_report(
 
     Note: Limited to 20 requests per user
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     # Validate limits
     if len(dimensions) > 15:
@@ -1023,7 +1261,7 @@ def enqueue_cost_report(
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/reporting/cost/enqueue"
 
-    params = {
+    params: dict[str, Any] = {
         "start_date": start_date,
         "end_date": end_date,
         "dimensions": ",".join(dimensions),
@@ -1034,8 +1272,7 @@ def enqueue_cost_report(
     if filters:
         for filter_expr in filters:
             params.setdefault("filters", []).append(filter_expr)
-    if sort:
-        params["sort"] = ",".join(sort)
+    _apply_sort(params, sort)
     if limit is not None:
         params["limit"] = limit
     if offset is not None:
@@ -1047,14 +1284,14 @@ def enqueue_cost_report(
     if apply_allocations is not None:
         params["applyAllocations"] = str(apply_allocations).lower()
 
-    response = requests.get(url, headers=headers, params=params)
+    response = _http_session.get(url, headers=headers, params=params)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 def get_report_state(
     report_id: str,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Check the processing state of an enqueued cost report.
 
@@ -1065,21 +1302,20 @@ def get_report_state(
     Returns:
         Object with status: "enqueued", "running", "errored", or "finished"
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/reporting/reports/{report_id}/state"
 
-    response = requests.get(url, headers=headers)
+    response = _http_session.get(url, headers=headers)
     response.raise_for_status()
-    return response.json()
+    return _response_json(response)
 
 def get_report_results(
     report_id: str,
     token: str | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Retrieve results from a finished enqueued cost report.
 
@@ -1093,61 +1329,15 @@ def get_report_results(
 
     Note: Enqueued reports paginate at 30,000 rows instead of 10,000
     """
-    if not authorization:
-        raise ValueError("Authorization token is required")
+    authorization = resolve_authorization(authorization)
 
     headers = get_auth_headers(authorization)
     url = f"{CLOUDABILITY_API_URL}/reporting/reports/{report_id}/results"
 
-    params = {}
+    params: dict[str, Any] = {}
     if token:
         params["token"] = token
 
-    response = requests.get(url, headers=headers, params=params)
+    response = _http_session.get(url, headers=headers, params=params)
     response.raise_for_status()
-    return response.json()
-
-# ============================================================================
-# COST REPORTS API (Legacy endpoints for backward compatibility)
-# ============================================================================
-
-def get_cost_reports_legacy(
-    start_date: str,
-    end_date: str,
-    dimensions: List[str] | None = None,
-    authorization: str | None = None
-) -> Dict[str, Any]:
-    """
-    Legacy cost reports endpoint for backward compatibility.
-    Note: This may not be the actual Cloudability API endpoint.
-    """
-    if not authorization:
-        raise ValueError("Authorization token is required")
-    
-    headers = get_auth_headers(authorization)
-    params = {
-        "start_date": start_date,
-        "end_date": end_date,
-        "dimensions": ','.join(dimensions) if dimensions else '',
-    }
-    
-    url = f"{CLOUDABILITY_API_URL}/reports/cost/run"
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()
-    return {"results": response.json().get("results", [])}
-
-def get_usage_data_legacy(period: str, authorization: str | None = None) -> Dict[str, Any]:
-    """
-    Legacy usage data endpoint for backward compatibility.
-    Note: This may not be the actual Cloudability API endpoint.
-    """
-    if not authorization:
-        raise ValueError("Authorization token is required")
-    
-    headers = get_auth_headers(authorization)
-    params = {"period": period}
-    
-    url = f"{CLOUDABILITY_API_URL}/reports/usage/run"
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()
-    return {"usage_records": response.json().get("results", [])}
+    return _response_json(response)

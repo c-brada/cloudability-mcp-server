@@ -6,7 +6,7 @@ This guide covers everything you need to know to develop and contribute to the C
 
 ### Prerequisites
 
-- **Python 3.12+**: Required for modern type annotations and performance
+- **Python 3.14+**: Required for modern type annotations and performance
 - **uv**: Fast Python package manager (recommended)
 - **Cloudability API Access**: Valid API token or environment access
 
@@ -14,7 +14,7 @@ This guide covers everything you need to know to develop and contribute to the C
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/your-org/cloudability-mcp-server.git
+   git clone https://github.com/eelzinaty/cloudability-mcp-server.git
    cd cloudability-mcp-server
    ```
 
@@ -49,9 +49,7 @@ This guide covers everything you need to know to develop and contribute to the C
 cloudability-mcp-server/
 ├── main.py                      # MCP server entry point with tool definitions
 ├── cloudability_tools.py        # Core API implementation and business logic
-├── run_server.py               # Development server runner
 ├── tests/                      # Test suite
-│   ├── test_cloudability.py     # Legacy endpoint tests
 │   └── test_cloudability_tools.py # Comprehensive API tests
 ├── .env.example                # Environment configuration template
 ├── pyproject.toml              # Project configuration and dependencies
@@ -141,7 +139,7 @@ def test_new_endpoint():
 
 1. **Start the development server**:
    ```bash
-   uv run python run_server.py
+   uv run python main.py
    ```
 
 2. **Test with MCP client**:
@@ -221,7 +219,7 @@ uv run black . && uv run isort . && uv run mypy main.py cloudability_tools.py
 - **Implement backoff**: Add retry logic for 429 responses
 
 #### Environment Issues
-- **Python Version**: Ensure Python 3.12+ is being used
+- **Python Version**: Ensure Python 3.14+ is being used
 - **Dependencies**: Run `uv sync` to update dependencies
 - **Environment Variables**: Verify `.env` file is properly configured
 
@@ -237,7 +235,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 For performance analysis:
 ```bash
-uv run python -m cProfile -o profile.stats run_server.py
+uv run python -m cProfile -o profile.stats main.py
 ```
 
 ## 📚 API Documentation
@@ -273,7 +271,7 @@ Different endpoints have different rate limits:
 ### Local Testing
 ```bash
 # Run the server
-uv run python run_server.py
+uv run python main.py
 
 # Test with curl (if HTTP mode)
 curl -X POST http://localhost:8000/tools \
@@ -304,6 +302,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed contribution guidelines.
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/your-org/cloudability-mcp-server/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-org/cloudability-mcp-server/discussions)
+- **Issues**: [GitHub Issues](https://github.com/eelzinaty/cloudability-mcp-server/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/eelzinaty/cloudability-mcp-server/discussions)
 - **Documentation**: [README.md](README.md)

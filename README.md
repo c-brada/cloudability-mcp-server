@@ -1,7 +1,7 @@
 # Cloudability MCP Server
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
 [![FastMCP](https://img.shields.io/badge/FastMCP-0.19+-green.svg)](https://github.com/jlowin/fastmcp)
 
 A comprehensive Model Context Protocol (MCP) server for the Cloudability API, providing advanced cost management, Kubernetes container analytics, and budget forecasting capabilities.
@@ -13,15 +13,15 @@ A comprehensive Model Context Protocol (MCP) server for the Cloudability API, pr
 - **💰 Budget Management**: Complete budget lifecycle with forecasting and alerts
 - **🚀 Production Ready**: Full test coverage, type safety, and error handling
 - **🌍 Multi-Region**: Support for US, EU, APAC, and ME Cloudability regions
-- **🔐 Flexible Auth**: Both modern Bearer tokens and legacy Basic authentication
+- **🔐 Flexible Auth**: Bearer tokens, legacy Basic auth, or Frontdoor API keys for automatic token acquisition
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 
-- **Python 3.12+** (required for modern type annotations)
+- **Python 3.14+** (required for modern type annotations)
 - **uv** (recommended package manager)
-- **Cloudability API access** (Bearer token or API key)
+- **Cloudability API access** (Bearer token, API key, or Frontdoor API keys in `.env`)
 
 ### Installation
 
@@ -41,7 +41,7 @@ cp .env.example .env
 # Edit .env with your Cloudability credentials
 
 # Run the server
-uv run python run_server.py
+uv run python main.py
 ```
 
 ### MCP Client Configuration
@@ -57,7 +57,11 @@ Add to your MCP client configuration:
       "cwd": "/path/to/cloudability-mcp-server",
       "env": {
         "CLOUDABILITY_API_URL": "https://api.cloudability.com/v3",
-        "CLOUDABILITY_ENVIRONMENT_ID": "your-environment-id"
+        "CLOUDABILITY_ENVIRONMENT_ID": "your-environment-id",
+        "CLOUDABILITY_DEFAULT_VIEW_ID": "12345",
+        "CLOUDABILITY_KEY_ACCESS": "your-public-key",
+        "CLOUDABILITY_KEY_SECRET": "your-private-key",
+        "CLOUDABILITY_FRONTDOOR_URL": "https://frontdoor.apptio.com/service/apikeylogin"
       }
     }
   }
@@ -70,20 +74,19 @@ Add to your MCP client configuration:
 - **🔥 Container Cost Allocation**: Complete Kubernetes cost allocation and monitoring
 - **🔥 Container Provisioning**: Cluster setup and Metrics Agent deployment
 - **🔥 Container Analytics**: Usage patterns, resource allocation, and efficiency analysis
-- **🔥 Container Discovery**: Labels, counts, and resource inventory management
+- **🔥 Container Discovery**: Labels and resource inventory via containers_report
 - **Cost Reporting**: Flexible, powerful cost analysis with 15 dimensions & 8 metrics
 - **Asynchronous Reports**: Queue long-running reports for background processing
 - **Budgets & Forecasting**: Complete budget lifecycle management and spending predictions
 - **Budget Subscriptions**: Email notifications for budget thresholds
 - **Estimates**: Current month spending projections with detailed breakdowns
 - **Forecasts**: Multi-month predictive analytics with confidence intervals
-- **Billing Accounts**: Access billing account information
-- **Legacy Endpoints**: Backward compatibility for existing integrations
-
+- **Vendor Accounts**: List cloud provider credential accounts (AWS, Azure, GCP, IBM, OCI)
 ### 🔐 **Flexible Authentication**
 - **Bearer Token**: Modern apptio-opentoken authentication
+- **Frontdoor API Keys**: Automatic apptio-opentoken acquisition when keys are set in the environment
 - **Basic Auth**: Traditional API key authentication
-- **Multi-Region Support**: US, EU, APAC, and ME regions
+- **Multi-Region Support**: US, EU, APAC, and ME Cloudability API and Frontdoor login endpoints
 
 ### 📊 **Advanced Analytics**
 - **Rich Filtering**: Filter by cluster, namespace, workload type, and more
@@ -120,9 +123,20 @@ cp .env.example .env
 
 ### Environment Variables
 
+Copy `.env.example` to `.env` and configure the variables below.
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CLOUDABILITY_API_URL` | No (defaults to US) | Cloudability API base URL for your region |
+| `CLOUDABILITY_ENVIRONMENT_ID` | Yes (for Bearer auth) | Environment ID from Access Administration |
+| `CLOUDABILITY_KEY_ACCESS` | No | Frontdoor public API key for automatic token acquisition |
+| `CLOUDABILITY_KEY_SECRET` | No | Frontdoor private API key (pair with `CLOUDABILITY_KEY_ACCESS`) |
+| `CLOUDABILITY_FRONTDOOR_URL` | No (defaults to US) | Frontdoor API key login endpoint for your region |
+| `CLOUDABILITY_DEFAULT_VIEW_ID` | Yes (for containers tools) | Default view ID for containers/report and clusters calls |
+
 ```bash
 # Cloudability API Base URL (choose based on your region)
-# US: https://api.cloudability.com/v3 (default)
+# US: https://api.cloudability.com/v3
 # EU: https://api-eu.cloudability.com/v3
 # APAC: https://api-au.cloudability.com/v3
 # ME: https://api-me.cloudability.com/v3
@@ -132,18 +146,51 @@ CLOUDABILITY_API_URL=https://api.cloudability.com/v3
 # Get this from your Access Administration environment
 CLOUDABILITY_ENVIRONMENT_ID=your-environment-id-here
 
-# Optional: Default view ID for filtering
-CLOUDABILITY_DEFAULT_VIEW_ID=0
+# Optional: Frontdoor API keys for automatic apptio-opentoken acquisition
+# When set, tools can omit the authorization parameter
+# CLOUDABILITY_KEY_ACCESS=your-public-key-here
+# CLOUDABILITY_KEY_SECRET=your-private-key-here
+
+# Optional: Frontdoor login URL (defaults to US region)
+# US: https://frontdoor.apptio.com/service/apikeylogin
+# EU: https://frontdoor-eu.apptio.com/service/apikeylogin
+# AU: https://frontdoor-au.apptio.com/service/apikeylogin
+# CLOUDABILITY_FRONTDOOR_URL=https://frontdoor.apptio.com/service/apikeylogin
+
+# Default view ID for containers API calls (required for containers/report and clusters)
+CLOUDABILITY_DEFAULT_VIEW_ID=12345
 ```
+
+#### Regional endpoints
+
+**Cloudability API (`CLOUDABILITY_API_URL`)**
+
+| Region | URL |
+|--------|-----|
+| US | `https://api.cloudability.com/v3` |
+| EU | `https://api-eu.cloudability.com/v3` |
+| APAC | `https://api-au.cloudability.com/v3` |
+| ME | `https://api-me.cloudability.com/v3` |
+
+**Frontdoor login (`CLOUDABILITY_FRONTDOOR_URL`)**
+
+| Region | URL |
+|--------|-----|
+| US | `https://frontdoor.apptio.com/service/apikeylogin` |
+| EU | `https://frontdoor-eu.apptio.com/service/apikeylogin` |
+| AU | `https://frontdoor-au.apptio.com/service/apikeylogin` |
 
 ### Authentication Methods
 
-#### 1. Bearer Token (Recommended)
+#### 1. Frontdoor API Keys (optional, server-side)
+When `CLOUDABILITY_KEY_ACCESS` and `CLOUDABILITY_KEY_SECRET` are set, the server exchanges them for an apptio-opentoken via `CLOUDABILITY_FRONTDOOR_URL`. Tool calls can omit the `authorization` parameter. Set `CLOUDABILITY_ENVIRONMENT_ID` as well — Bearer authentication still requires it.
+
+#### 2. Bearer Token
 For modern Cloudability environments using apptio-opentoken:
 - Set `CLOUDABILITY_ENVIRONMENT_ID` in your environment
-- Pass `authorization: "Bearer your-apptio-opentoken"` to tool calls
+- Pass `authorization: "Bearer your-apptio-opentoken"` to tool calls (unless Frontdoor keys handle auth for you)
 
-#### 2. Basic Auth (Legacy)
+#### 3. Basic Auth (Legacy)
 For traditional API key authentication:
 - Pass `authorization: "Basic your-api-key:"` to tool calls
 - No environment ID required
@@ -153,12 +200,22 @@ For traditional API key authentication:
 ### Running the Server
 
 ```bash
-# Run the server directly
 uv run python main.py
-
-# Or use the run script
-uv run python run_server.py
 ```
+
+### MCP Reference Resources
+
+Read-only reference data for building cost reports (cached, default TTL 15 minutes via `CLOUDABILITY_RESOURCE_CACHE_TTL_SECONDS`):
+
+| URI | Description |
+|-----|-------------|
+| `cloudability://config` | Server config (API URL, default view ID, auth mode — no secrets) |
+| `cloudability://measures` | Cost report dimensions and metrics catalog |
+| `cloudability://measures/allocated` | Measures supported with cost allocations |
+| `cloudability://filter-operators` | Filter operator reference (`==`, `=@`, `[]=`, …) |
+| `cloudability://saved-reports` | Saved cost report definitions |
+
+Use `resources/read` in your MCP client, or call the matching tools (`get_available_measures`, etc.) for the same data.
 
 ### Available Tools
 
@@ -170,36 +227,29 @@ uv run python run_server.py
 ##### `get_cluster_deployment_yaml`
 **Get deployment configuration** for installing the Cloudability Metrics Agent in your cluster.
 
-##### `analyze_container_cost_allocations`
-**Primary container cost allocation tool** - The most important tool for Kubernetes cost analysis.
+##### `containers_report`
+**Primary container cost allocation tool** — replaces the retired `/containers/allocations` and `/containers/counts` APIs with `POST /v3/containers/report`.
 
 **Key Features:**
-- **Shared resource allocation**: Divides cluster costs based on actual usage patterns
-- **Fair share calculations**: Accounts for resource reservations and actual consumption
-- **Unallocated tracking**: Identifies idle resources and optimization opportunities
-- **Flexible grouping**: namespace, service, deployment, pod, labels, etc.
-- **Resource metrics**: CPU, memory, network, filesystem usage and reservations
+- **Shared resource allocation**: Fairshare and allocated cost metrics by namespace, workload, cluster, and labels
+- **Flexible grouping**: namespace, workload_type, workload_name, pod, labels, etc.
+- **Filtering**: cluster UUID, namespace, workload type, and more
 
 **Parameters:**
-- `group`: Grouping dimensions (e.g., ["namespace", "service", "cldy:labels:team"])
-- `metrics`: Resource metrics (e.g., ["cpu/reserved", "memory/reserved_rss"])
+- `group`: Grouping dimensions (e.g., ["namespace"], ["cldy:labels:team"])
+- `metrics`: Report metrics (e.g., ["total_cost", "total_cost_efficiency"])
 - `filters`: Scope analysis (e.g., ["cluster==uuid", "namespace==production"])
-- `cost_type`: "adjusted_cost", "adjusted_amortized_cost"
+- `cost_type`: "adjusted" or "total_adjusted_amortized"
 
 **Returns:**
-- Cost allocations with fair share calculations
-- Resource usage metrics and allocation percentages
-- Unallocated resources and optimization insights
-- Available capacity and weighting factors
+- `result.data` rows with grouped dimensions and metrics
+- Pagination via `result.pagination.nextToken`
 
 ##### `get_container_resource_usage`
 **Daily usage trends** for capacity planning and rightsizing analysis.
 
 ##### `discover_container_labels`
 **Find available Kubernetes labels** for custom cost allocation groupings.
-
-##### `count_container_resources`
-**Resource inventory** - Count namespaces, services, pods across clusters.
 
 ##### `get_detailed_cluster_info`
 **Comprehensive cluster metadata** with node details and data collection status.
@@ -215,8 +265,20 @@ uv run python run_server.py
 ##### `get_budget`
 **Get detailed budget information** including spend tracking and alerts.
 
-##### `list_billing_accounts`
-**Get billing account information** across cloud providers.
+##### `list_aws_accounts`
+**Get AWS vendor credential accounts** configured in Cloudability (`GET /v3/vendors/AWS/accounts?viewId=0`).
+
+##### `list_azure_accounts`
+**Get Azure vendor credential accounts** configured in Cloudability (`GET /v3/vendors/azure/accounts?viewId=0`).
+
+##### `list_gcp_accounts`
+**Get GCP vendor credential accounts** configured in Cloudability (`GET /v3/vendors/gcp/accounts?viewId=0`).
+
+##### `list_ibm_accounts`
+**Get IBM Cloud vendor credential accounts** configured in Cloudability (`GET /v3/vendors/ibm/accounts?viewId=0`).
+
+##### `list_oci_accounts`
+**Get OCI vendor credential accounts** configured in Cloudability (`GET /v3/vendors/oci/accounts?viewId=0`).
 
 #### 📊 **Budgets & Forecasting Tools**
 
@@ -230,6 +292,31 @@ uv run python run_server.py
 - Comparison with previous month actuals
 - Rate limiting: 10 requests/user/minute, 20/org/minute
 
+**Response format:** Standard Cloudability v3 envelope. All fields are under `result` (not top-level):
+
+```json
+{
+  "result": {
+    "estimatedSpend": 35615446.36,
+    "previousMonthSpend": 33819722.57,
+    "previousMonthFinalized": true,
+    "currentDate": "2026-05-24",
+    "cumulativeMtdSpend": [{"date": "2026-05-01", "spend": 1615288.82}],
+    "details": [
+      {
+        "serviceName": "Azure Compute",
+        "estimatedSpend": 5568954.48,
+        "mtdSpend": 4128094.29,
+        "previousMonthSpend": 5409219.11,
+        "usageFamily": "Instance Usage"
+      }
+    ]
+  }
+}
+```
+
+Use `result["details"]` for vendor or service breakdowns (for example, filter lines where `serviceName` starts with `Azure`). Omit `view_id` or set it from the `cloudability://config` resource `default_view_id` when using the server's configured default view (`0` means all org cost data).
+
 ##### `get_spending_forecast`
 **Multi-month predictive analytics** with confidence intervals and historical comparison.
 
@@ -240,11 +327,7 @@ uv run python run_server.py
 - `remove_credits`: Exclude credits from analysis
 - `remove_one_time_charges`: Filter out one-time costs
 
-**Returns:**
-- Monthly forecasts with upper/lower bounds
-- Service-level forecast details
-- Historical actuals for comparison
-- Model parameters and confidence metrics
+**Returns:** Cloudability v3 envelope with forecast data under `result` (for example `result.forecast`, `result.forecastDetail`, `result.actual`, `result.parameters`).
 
 ##### `create_new_budget`
 **Create budgets** with monthly thresholds and cost basis configuration.
@@ -262,8 +345,8 @@ uv run python run_server.py
 - `notify_exceeded`: Alerts when actual spend exceeds budget
 - `notify_expected`: Alerts when projected spend exceeds budget
 
-##### `get_budget_alert` / `list_budget_alerts`
-**Manage budget subscriptions** and notification preferences.
+##### `list_budget_alerts`
+**List budget subscriptions** and notification preferences.
 
 ##### `modify_budget_alert` / `remove_budget_alert`
 **Update or delete** budget notification subscriptions.
@@ -313,25 +396,23 @@ uv run python run_server.py
 ##### `check_report_status` / `get_queued_report_results`
 **Manage asynchronous reports** from queue to completion.
 
-#### 🔄 **Legacy Tools (Backward Compatibility)**
-
-##### `get_cost_reports`
-Legacy cost reports endpoint (may not reflect actual API structure).
-
-##### `get_usage_data`
-Legacy usage data endpoint (may not reflect actual API structure).
-
 ## Testing
 
 Run the test suite:
 
 ```bash
-# Run tests
+# Run unit tests (mocked HTTP; integration tests are skipped by default)
 uv run pytest tests/ -v
 
 # Run tests with coverage
 uv run pytest tests/ -v --cov=main --cov-report=term-missing
+
+# Run live MCP + Cloudability API integration tests (requires .env credentials)
+cp .env.example .env   # set CLOUDABILITY_KEY_ACCESS, CLOUDABILITY_KEY_SECRET, CLOUDABILITY_ENVIRONMENT_ID
+uv run pytest tests/test_mcp_integration.py -v -m integration
 ```
+
+Integration tests cover 10 core read-only MCP tools (budgets, cost reporting, containers), 3 optional tools that skip when your tenant lacks access, plus a chained `get_budget` test.
 
 ## Examples
 
@@ -352,31 +433,31 @@ deployment = get_cluster_deployment_yaml(
 # Save deployment["deployment_yaml"] and apply: kubectl apply -f deployment.yaml
 
 # Analyze cost allocation by namespace (primary use case)
-allocation = analyze_container_cost_allocations(
+allocation = containers_report(
     start_date="2024-01-01",
     end_date="2024-01-31",
     group=["namespace"],
-    metrics=["cpu/reserved", "memory/reserved_rss"],
+    metrics=["total_cost", "total_cost_efficiency"],
     authorization="Bearer your-token"
 )
 
 # Team-based cost allocation using labels
-team_costs = analyze_container_cost_allocations(
+team_costs = containers_report(
     start_date="2024-01-01",
     end_date="2024-01-31",
     group=["cldy:labels:team", "namespace"],
-    metrics=["cpu/reserved", "memory/reserved_rss", "network/tx"],
+    metrics=["total_cost", "total_cost_allocated"],
     filters=["cluster==your-cluster-uuid"],
-    cost_type="adjusted_amortized_cost",
+    cost_type="total_adjusted_amortized",
     authorization="Bearer your-token"
 )
 
-# Service-level cost breakdown for specific namespace
-service_costs = analyze_container_cost_allocations(
+# Workload-level cost breakdown for a namespace
+service_costs = containers_report(
     start_date="2024-01-01",
     end_date="2024-01-31",
-    group=["service", "deployment"],
-    metrics=["cpu/reserved", "memory/reserved_rss"],
+    group=["workload_name", "workload_type"],
+    metrics=["total_cost"],
     filters=["namespace==production", "cluster==your-cluster-uuid"],
     authorization="Bearer your-token"
 )
@@ -398,15 +479,6 @@ labels = discover_container_labels(
     start_date="2024-01-01",
     end_date="2024-01-31",
     filters=["cluster==your-cluster-uuid"],
-    authorization="Bearer your-token"
-)
-
-# Count resources across clusters
-resource_counts = count_container_resources(
-    start_date="2024-01-01",
-    end_date="2024-01-31",
-    dimensions=["namespace", "service", "pod"],
-    group=["cluster"],
     authorization="Bearer your-token"
 )
 
@@ -462,11 +534,20 @@ budget_details = get_budget(
 
 ### Spending Estimates & Forecasts
 ```python
-# Get current month spending estimate
+# Get current month spending estimate (fields are under result)
 estimate = get_spending_estimate(
     view_id="0",
     basis="cash",
     authorization="Bearer your-token"
+)
+summary = estimate["result"]
+print(summary["estimatedSpend"], summary["currentDate"])
+
+# Azure month-end estimate from service breakdown
+azure_estimate = sum(
+    row["estimatedSpend"]
+    for row in summary["details"]
+    if row["serviceName"].startswith("Azure")
 )
 
 # Generate 12-month forecast based on 6 months of history
@@ -479,6 +560,7 @@ forecast = get_spending_forecast(
     remove_one_time_charges=True,
     authorization="Bearer your-token"
 )
+forecast_rows = forecast["result"]["forecast"]
 ```
 
 ### Budget Management
@@ -578,11 +660,9 @@ cloudability-mcp-server/
 ├── main.py                      # Main MCP server with tool definitions
 ├── cloudability_tools.py        # Core API implementation
 ├── tests/
-│   ├── test_cloudability.py     # Legacy endpoint tests
 │   └── test_cloudability_tools.py # Comprehensive API tests
 ├── .env.example                 # Environment configuration template
 ├── pyproject.toml              # Project configuration
-├── run_server.py               # Server runner script
 └── README.md                   # This documentation
 ```
 
@@ -632,9 +712,9 @@ uv run black . && uv run isort .
 
 ## 🐛 Issues & Support
 
-- **Bug Reports**: [GitHub Issues](https://github.com/your-org/cloudability-mcp-server/issues)
-- **Feature Requests**: [GitHub Issues](https://github.com/your-org/cloudability-mcp-server/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-org/cloudability-mcp-server/discussions)
+- **Bug Reports**: [GitHub Issues](https://github.com/eelzinaty/cloudability-mcp-server/issues)
+- **Feature Requests**: [GitHub Issues](https://github.com/eelzinaty/cloudability-mcp-server/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/eelzinaty/cloudability-mcp-server/discussions)
 
 ## 📄 License
 

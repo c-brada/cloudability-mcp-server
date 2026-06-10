@@ -1,13 +1,15 @@
 from fastmcp import FastMCP
-from typing import Dict, List, Optional, Any
+from typing import Annotated, Any
+from pydantic import BeforeValidator, Field
+import json as _json
+
+from cloudability_resources import register_resources
 from cloudability_tools import (
     get_containers_report,
     get_clusters,
     get_budgets,
     get_budget_details,
-    get_billing_accounts,
-    get_cost_reports_legacy,
-    get_usage_data_legacy,
+    get_vendor_accounts,
     # Budgets & Forecasting APIs
     get_estimate,
     get_forecast,
@@ -15,7 +17,6 @@ from cloudability_tools import (
     update_budget,
     delete_budget,
     create_budget_subscription,
-    get_budget_subscription,
     list_budget_subscriptions,
     update_budget_subscription,
     delete_budget_subscription,
@@ -33,21 +34,25 @@ from cloudability_tools import (
     list_provisioned_clusters,
     update_provisioned_cluster,
     get_container_clusters,
-    get_container_allocations,
     get_container_usage,
     get_container_labels,
-    get_container_counts,
-    # Container APIs
-    provision_cluster,
-    get_cluster_deployment_config,
-    list_provisioned_clusters,
-    update_provisioned_cluster,
-    get_container_clusters,
-    get_container_allocations,
-    get_container_usage,
-    get_container_labels,
-    get_container_counts
 )
+
+
+def _coerce_str_list(v: Any) -> Any:
+    """Accept a JSON-encoded string in place of a list, e.g. '["a","b"]' → ["a","b"]."""
+    if isinstance(v, str):
+        try:
+            parsed = _json.loads(v)
+            if isinstance(parsed, list):
+                return parsed
+        except (_json.JSONDecodeError, ValueError):
+            pass
+        return [v]  # single bare string → one-element list
+    return v
+
+
+StrList = Annotated[list[str], BeforeValidator(_coerce_str_list)]
 
 mcp = FastMCP("Cloudability MCP Server")
 
@@ -60,64 +65,189 @@ def containers_report(
     start_date: str,
     end_date: str,
     cost_type: str = "adjusted",
-    metrics: List[str] | None = None,
-    group: List[str] | None = None,
-    filters: List[str] | None = None,
-    widget_type: str = "top",
+    metrics: Annotated[
+        StrList | None,
+        Field(
+            default=None,
+            description=(
+                'Metrics to retrieve. Defaults to ["total_cost", "total_cost_efficiency"] '
+                "if omitted. total_cost is fairshare-allocated workload cost, NOT "
+                "billing/invoiced cost — use execute_cost_report for unblended_cost, "
+                "idle overhead, and amortized metrics."
+            ),
+        ),
+    ] = None,
+    group: Annotated[
+        StrList | None,
+        Field(
+            default=None,
+            description=(
+                "Grouping dimensions. Standard values: cluster, namespace, workload_type, "
+                "workload_name, container, pod, node, region, zone. Kubernetes labels: "
+                "cldy:labels:<key>. Time grouping: only day is supported (not month); use "
+                "group=['day'] with widget_type bar or line. widget_type top must not "
+                "include time dimensions — split the date range or aggregate days client-side."
+            ),
+        ),
+    ] = None,
+    count: Annotated[
+        StrList | None,
+        Field(
+            default=None,
+            description=(
+                "Dimensions to count distinct values for (replaces retired /containers/counts). "
+                "Returns counts under result.data[].count. Examples: namespace, workload_name, "
+                "pod, cluster. Combine with group to count within each group row."
+            ),
+        ),
+    ] = None,
+    filters: Annotated[
+        StrList | None,
+        Field(
+            default=None,
+            description=(
+                "Filter expressions (e.g., cluster==<uuid>, namespace==kube-system, "
+                "workload_type[]=deployment,statefulset). Cluster filters require the "
+                "cluster UUID from list_clusters, not the cluster name."
+            ),
+        ),
+    ] = None,
+    widget_type: Annotated[
+        str,
+        Field(
+            default="top",
+            description=(
+                "Response format: top (table, default), bar, or line. kpi is accepted but "
+                "remapped to top because the Cloudability API returns HTTP 400 for kpi — "
+                "use top with no group (org total) or group=['cluster'] with a cluster "
+                "filter (cluster total). Use bar/line only when group includes day for "
+                "time-series output. top must not include day/month in group."
+            ),
+        ),
+    ] = "top",
     limit: int = 50,
-    sort: List[Dict[str, str]] | None = None,
-    view_id: Optional[str] = None,
+    pagination_token: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Pagination token from result.pagination.nextToken for the next page. "
+                "When set, all other request parameters must match the original query "
+                "exactly. Responses may be truncated at limit with no further pages "
+                "retrievable if this is omitted."
+            ),
+        ),
+    ] = None,
+    sort: list[dict[str, str]] | None = None,
+    view_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted)",
+        ),
+    ] = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
-    Get comprehensive containers cost and usage report from Cloudability.
+    Get Kubernetes workload cost and usage report from Cloudability (fairshare model).
 
-    This is the main containers reporting endpoint providing detailed cost and usage
-    analytics for Kubernetes workloads with advanced filtering and grouping capabilities.
+    Reports fairshare-allocated container costs for namespaces, workloads, and clusters.
+    total_cost does not reconcile with execute_cost_report billing totals and omits
+    unallocated/idle overhead in namespace breakdowns. Use execute_cost_report for
+    invoiced cost, idle resources, and amortized metrics.
 
     Args:
         start_date: Start date in YYYY-MM-DD format
         end_date: End date in YYYY-MM-DD format
         cost_type: Cost type - "adjusted" (cash) or "total_adjusted_amortized"
-        metrics: List of metrics to retrieve (e.g., ["total_cost", "total_cost_efficiency"])
-        group: List of dimensions to group by (e.g., ["cluster", "namespace"])
-        filters: List of filter expressions (e.g., ["cluster==uuid", "namespace==kube-system"])
-        widget_type: Widget type - "top", "kpi", "bar", or "line"
-        limit: Maximum number of results (1-1000)
+        metrics: Defaults to ["total_cost", "total_cost_efficiency"] when omitted
+        group: Grouping dimensions (see parameter Field description for valid values)
+        count: Distinct-value counts per row (replaces retired count_container_resources)
+        filters: Filter expressions (cluster==uuid from list_clusters; not clusterName)
+        widget_type: top (table), bar, or line; kpi is remapped to top (see Field desc)
+        limit: Maximum number of results (1-1000); may truncate — use pagination_token
         sort: List of sort configurations with sortMetric and sortOrder
-        view_id: Optional Cloudability view identifier
+        pagination_token: nextToken from a prior response for the next page
+        view_id: Cloudability view ID (required unless CLOUDABILITY_DEFAULT_VIEW_ID is set)
         authorization: Bearer token or Basic auth header
 
     Returns:
-        Detailed cost and usage report with metrics, dimensions, and pagination info
+        Report with result.data rows, result.pagination (hasNext, nextToken), and
+        _kpi_remapped_to_top when widget_type kpi was translated to top
+
+    Grouping notes (per Cloudability Report API):
+        - Standard: cluster, namespace, workload_type, workload_name, container, pod, etc.
+        - Labels: cldy:labels:<key> (discover keys with discover_container_labels)
+        - Time: only day is valid; month/year_month are not supported on this endpoint
+        - widget_type top: aggregated table over the full date range (no time in group)
+        - widget_type bar/line: requires group to include day for time-series buckets
+        - KPI totals: use top with no group (org) or top + group cluster + cluster filter
+
+    Example:
+        group=["cldy:labels:team"], filters=["cluster==dd2d2d9a-6d6b-4965-8fbf-3482f9a4e7a3"]
+
+        group=["cluster"], count=["namespace"], filters=["cluster==dd2d2d9a-..."]
     """
     return get_containers_report(
-        start_date, end_date, cost_type, metrics, group, filters,
-        widget_type, limit, sort, view_id, authorization
+        start_date,
+        end_date,
+        cost_type,
+        metrics,
+        group,
+        count,
+        filters,
+        widget_type,
+        limit,
+        sort,
+        view_id,
+        pagination_token,
+        authorization,
     )
 
 @mcp.tool()
-def list_clusters(authorization: str | None = None) -> Dict[str, Any]:
+def list_clusters(
+    start_date: str,
+    end_date: str,
+    view_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted)",
+        ),
+    ] = None,
+    concise: bool = True,
+    authorization: str | None = None,
+) -> dict[str, Any]:
     """
     Get list of all Kubernetes clusters in Cloudability.
 
-    Returns cluster information including UUIDs, names, and metadata needed
-    for filtering other API calls.
+    Returns cluster information including UUIDs, names, vendor, cluster type,
+    and metadata needed for filtering other API calls.
 
     Args:
+        start_date: Start date for cluster data window (YYYY-MM-DD)
+        end_date: End date for cluster data window (YYYY-MM-DD)
+        view_id: Cloudability view ID (required unless CLOUDABILITY_DEFAULT_VIEW_ID is set)
+        concise: When True, omit per-node details (faster, smaller payload)
         authorization: Bearer token or Basic auth header
 
     Returns:
-        List of clusters with their identifiers and metadata
+        Clusters with identifiers, names, vendor, clusterType, and timestamps
     """
-    return get_clusters(authorization)
+    return get_clusters(
+        start_date=start_date,
+        end_date=end_date,
+        view_id=view_id,
+        concise=concise,
+        authorization=authorization,
+    )
 
 # ============================================================================
 # BUDGETS TOOLS
 # ============================================================================
 
 @mcp.tool()
-def list_budgets(authorization: str | None = None) -> Dict[str, Any]:
+def list_budgets(authorization: str | None = None) -> dict[str, Any]:
     """
     Get list of all budgets configured in Cloudability.
 
@@ -130,7 +260,7 @@ def list_budgets(authorization: str | None = None) -> Dict[str, Any]:
     return get_budgets(authorization)
 
 @mcp.tool()
-def get_budget(budget_id: str, authorization: str | None = None) -> Dict[str, Any]:
+def get_budget(budget_id: str, authorization: str | None = None) -> dict[str, Any]:
     """
     Get detailed information for a specific budget.
 
@@ -144,32 +274,119 @@ def get_budget(budget_id: str, authorization: str | None = None) -> Dict[str, An
     return get_budget_details(budget_id, authorization)
 
 # ============================================================================
-# BILLING ACCOUNTS TOOLS
+# VENDOR ACCOUNTS TOOLS
 # ============================================================================
 
 @mcp.tool()
-def list_billing_accounts(authorization: str | None = None) -> Dict[str, Any]:
-    """
-    Get list of billing accounts configured in Cloudability.
+def list_aws_accounts(
+    view_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description='Cloudability view ID (defaults to "0" for all org accounts)',
+        ),
+    ] = None,
+    authorization: str | None = None,
+) -> dict[str, Any]:
+    """Get list of AWS vendor credential accounts configured in Cloudability."""
+    return get_vendor_accounts("aws", view_id, authorization)
 
-    Args:
-        authorization: Bearer token or Basic auth header
 
-    Returns:
-        List of billing accounts with their configurations and metadata
-    """
-    return get_billing_accounts(authorization)
+@mcp.tool()
+def list_azure_accounts(
+    view_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description='Cloudability view ID (defaults to "0" for all org accounts)',
+        ),
+    ] = None,
+    authorization: str | None = None,
+) -> dict[str, Any]:
+    """Get list of Azure vendor credential accounts configured in Cloudability."""
+    return get_vendor_accounts("azure", view_id, authorization)
+
+
+@mcp.tool()
+def list_gcp_accounts(
+    view_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description='Cloudability view ID (defaults to "0" for all org accounts)',
+        ),
+    ] = None,
+    authorization: str | None = None,
+) -> dict[str, Any]:
+    """Get list of GCP vendor credential accounts configured in Cloudability."""
+    return get_vendor_accounts("gcp", view_id, authorization)
+
+
+@mcp.tool()
+def list_ibm_accounts(
+    view_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description='Cloudability view ID (defaults to "0" for all org accounts)',
+        ),
+    ] = None,
+    authorization: str | None = None,
+) -> dict[str, Any]:
+    """Get list of IBM Cloud vendor credential accounts configured in Cloudability."""
+    return get_vendor_accounts("ibm", view_id, authorization)
+
+
+@mcp.tool()
+def list_oci_accounts(
+    view_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description='Cloudability view ID (defaults to "0" for all org accounts)',
+        ),
+    ] = None,
+    authorization: str | None = None,
+) -> dict[str, Any]:
+    """Get list of OCI vendor credential accounts configured in Cloudability."""
+    return get_vendor_accounts("oci", view_id, authorization)
 
 # ============================================================================
 # BUDGETS & FORECASTING TOOLS
 # ============================================================================
 
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "Generate a spending estimate for the current month based on month-to-date "
+        "usage and historical patterns. "
+        "Response is the Cloudability v3 envelope {\"result\": {...}}; summary and "
+        "breakdown fields are nested under result (not top-level): "
+        "result.estimatedSpend (projected month-end total), "
+        "result.previousMonthSpend, result.previousMonthFinalized, "
+        "result.currentDate (YYYY-MM-DD), "
+        "result.cumulativeMtdSpend ([{date, spend}, ...]), and "
+        "result.details ([{serviceName, estimatedSpend, mtdSpend, "
+        "previousMonthSpend, usageFamily}, ...] for service/vendor breakdown). "
+        "Filter vendors via result.details (e.g. lines where serviceName starts with "
+        "\"Azure\"). Omit view_id to use CLOUDABILITY_DEFAULT_VIEW_ID; pass "
+        "view_id \"0\" for all org cost data. "
+        "Rate limit: 10 requests/user/minute, 20/org/minute."
+    ),
+)
 def get_spending_estimate(
-    view_id: str = "0",
+    view_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted; "
+                "pass \"0\" for all org cost data)"
+            ),
+        ),
+    ] = None,
     basis: str = "cash",
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Generate a spending estimate for the current month.
 
@@ -177,24 +394,50 @@ def get_spending_estimate(
     and month-to-date usage, including spending drivers by service and usage family.
 
     Args:
-        view_id: View ID to generate estimate for (0 = all cost data)
+        view_id: Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted;
+            pass "0" for all org cost data)
         basis: Cost basis - "cash", "amortized", "adjusted", "adjustedAmortized", "list"
         authorization: Bearer token or Basic auth header
 
     Returns:
-        Estimate object with:
-        - estimatedSpend: Projected spending for current month
-        - previousMonthSpend: Last month's total spending
-        - cumulativeMtdSpend: Daily spending progression
-        - details: Spending drivers by service/usage family
+        Cloudability v3 envelope ``{"result": {...}}``. Summary and breakdown
+        fields are nested under ``result`` (not top-level):
+
+        - result.estimatedSpend: Projected spending for current month
+        - result.previousMonthSpend: Last month's total spending
+        - result.previousMonthFinalized: Whether prior month actuals are final
+        - result.currentDate: As-of date for the estimate (YYYY-MM-DD)
+        - result.cumulativeMtdSpend: Daily MTD progression [{date, spend}, ...]
+        - result.details: Spending drivers by service/usage family
+          [{serviceName, estimatedSpend, mtdSpend, previousMonthSpend, usageFamily}, ...]
 
     Note: Limited to 10 requests per user per minute, 20 per org per minute
     """
     return get_estimate(view_id, basis, authorization)
 
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "Generate a multi-month spending forecast from historical patterns. "
+        "Response is the Cloudability v3 envelope {\"result\": {...}}; forecast data "
+        "is nested under result (not top-level), including result.forecast "
+        "(monthly projections with confidence bounds), result.forecastDetail "
+        "(service-level breakdown), result.actual, result.actualDetail, and "
+        "result.parameters. Omit view_id to use CLOUDABILITY_DEFAULT_VIEW_ID; pass "
+        "view_id \"0\" for all org cost data. "
+        "Rate limit: 10 requests/user/minute, 20/org/minute."
+    ),
+)
 def get_spending_forecast(
-    view_id: str = "0",
+    view_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted; "
+                "pass \"0\" for all org cost data)"
+            ),
+        ),
+    ] = None,
     basis: str = "cash",
     months_back: int = 6,
     months_forward: int = 12,
@@ -202,7 +445,7 @@ def get_spending_forecast(
     remove_credits: bool = False,
     remove_one_time_charges: bool = False,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Generate a spending forecast for future months.
 
@@ -210,7 +453,8 @@ def get_spending_forecast(
     future costs with confidence intervals and detailed service breakdowns.
 
     Args:
-        view_id: View ID to generate forecast for (0 = all cost data)
+        view_id: Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted;
+            pass "0" for all org cost data)
         basis: Cost basis - "cash", "amortized", "adjusted", "adjustedAmortized", "list"
         months_back: Months of history to use for prediction (3-24)
         months_forward: Months to forecast into the future (1-24)
@@ -220,12 +464,12 @@ def get_spending_forecast(
         authorization: Bearer token or Basic auth header
 
     Returns:
-        Forecast object with:
-        - forecast: Monthly projections with confidence bounds
-        - forecastDetail: Service-level forecast breakdowns
-        - actual: Historical spending for comparison
-        - actualDetail: Historical service-level spending
-        - parameters: Forecast configuration used
+        Cloudability v3 envelope ``{"result": {...}}``. Forecast fields are
+        nested under ``result``, for example ``result.forecast``,
+        ``result.forecastDetail``, ``result.actual``, ``result.actualDetail``,
+        and ``result.parameters``.
+
+    Note: Limited to 10 requests per user per minute, 20 per org per minute
     """
     return get_forecast(
         view_id, basis, months_back, months_forward,
@@ -242,9 +486,9 @@ def create_new_budget(
     name: str,
     basis: str,
     view_id: str = "0",
-    months: List[Dict[str, Any]] | None = None,
+    months: list[dict[str, Any]] | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Create a new budget with monthly thresholds.
 
@@ -272,9 +516,9 @@ def modify_budget(
     name: str | None = None,
     basis: str | None = None,
     view_id: str | None = None,
-    months: List[Dict[str, Any]] | None = None,
+    months: list[dict[str, Any]] | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Update an existing budget configuration.
 
@@ -292,7 +536,7 @@ def modify_budget(
     return update_budget(budget_id, name, basis, view_id, months, authorization)
 
 @mcp.tool()
-def remove_budget(budget_id: str, authorization: str | None = None) -> Dict[str, Any]:
+def remove_budget(budget_id: str, authorization: str | None = None) -> dict[str, Any]:
     """
     Delete a budget permanently.
 
@@ -316,7 +560,7 @@ def create_budget_alert(
     notify_exceeded: bool = False,
     notify_expected: bool = False,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Create email notifications for budget thresholds.
 
@@ -332,24 +576,7 @@ def create_budget_alert(
     return create_budget_subscription(budget_id, notify_exceeded, notify_expected, authorization)
 
 @mcp.tool()
-def get_budget_alert(
-    subscription_id: str,
-    authorization: str | None = None
-) -> Dict[str, Any]:
-    """
-    Get details of a specific budget subscription.
-
-    Args:
-        subscription_id: UUID of the subscription
-        authorization: Bearer token or Basic auth header
-
-    Returns:
-        Budget subscription object with notification settings
-    """
-    return get_budget_subscription(subscription_id, authorization)
-
-@mcp.tool()
-def list_budget_alerts(authorization: str | None = None) -> Dict[str, Any]:
+def list_budget_alerts(authorization: str | None = None) -> dict[str, Any]:
     """
     Get all budget subscriptions and their notification settings.
 
@@ -368,7 +595,7 @@ def modify_budget_alert(
     notify_exceeded: bool | None = None,
     notify_expected: bool | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Update budget subscription notification settings.
 
@@ -390,7 +617,7 @@ def modify_budget_alert(
 def remove_budget_alert(
     subscription_id: str,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Delete a budget subscription permanently.
 
@@ -409,7 +636,7 @@ def remove_budget_alert(
 # ============================================================================
 
 @mcp.tool()
-def list_saved_cost_reports(authorization: str | None = None) -> Dict[str, Any]:
+def list_saved_cost_reports(authorization: str | None = None) -> dict[str, Any]:
     """
     Get list of saved cost reports owned by or shared with the user/organization.
 
@@ -422,13 +649,13 @@ def list_saved_cost_reports(authorization: str | None = None) -> Dict[str, Any]:
     Returns:
         List of cost report objects with complete configurations and metadata
     """
-    return list_cost_reports(authorization)
+    return {"result": list_cost_reports(authorization)}
 
 @mcp.tool()
 def get_available_measures(
     apply_allocations: bool | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Get comprehensive list of available cost reporting measures.
 
@@ -445,10 +672,10 @@ def get_available_measures(
         - Metrics: total_cost, amortized_cost, usage_hours, etc.
         - Each with data_type, description, group, and sub_group info
     """
-    return get_cost_measures(apply_allocations, authorization)
+    return {"result": get_cost_measures(apply_allocations, authorization)}
 
 @mcp.tool()
-def get_filter_operators(authorization: str | None = None) -> Dict[str, Any]:
+def get_filter_operators(authorization: str | None = None) -> dict[str, Any]:
     """
     Get list of available filter operators for cost reporting.
 
@@ -465,16 +692,16 @@ def get_filter_operators(authorization: str | None = None) -> Dict[str, Any]:
         - []= (in), []!= (not in)
         - === (strictly equals), !== (strictly not equals)
     """
-    return get_cost_filter_operators(authorization)
+    return {"result": get_cost_filter_operators(authorization)}
 
 @mcp.tool()
 def execute_cost_report(
     start_date: str,
     end_date: str,
-    dimensions: List[str],
-    metrics: List[str],
-    filters: List[str] | None = None,
-    sort: List[str] | None = None,
+    dimensions: StrList,
+    metrics: StrList,
+    filters: StrList | None = None,
+    sort: StrList | None = None,
     limit: int | None = None,
     offset: int | None = None,
     chart: bool = False,
@@ -482,7 +709,7 @@ def execute_cost_report(
     apply_allocations: bool | None = None,
     token: str | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Execute a comprehensive cost report with advanced filtering and analytics.
 
@@ -534,17 +761,17 @@ def execute_cost_report(
 def queue_cost_report(
     start_date: str,
     end_date: str,
-    dimensions: List[str],
-    metrics: List[str],
-    filters: List[str] | None = None,
-    sort: List[str] | None = None,
+    dimensions: StrList,
+    metrics: StrList,
+    filters: StrList | None = None,
+    sort: StrList | None = None,
     limit: int | None = None,
     offset: int | None = None,
     chart: bool = False,
     view_id: str | None = None,
     apply_allocations: bool | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Queue a cost report for asynchronous processing.
 
@@ -583,7 +810,7 @@ def queue_cost_report(
 def check_report_status(
     report_id: str,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Check the processing status of a queued cost report.
 
@@ -605,7 +832,7 @@ def get_queued_report_results(
     report_id: str,
     token: str | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Retrieve results from a completed queued cost report.
 
@@ -631,7 +858,7 @@ def provision_kubernetes_cluster(
     kubernetes_version: str | None = None,
     cluster_version: str | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Provision a new Kubernetes cluster for Cloudability monitoring.
 
@@ -656,7 +883,7 @@ def provision_kubernetes_cluster(
 def get_cluster_deployment_yaml(
     cluster_id: str,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Get the Kubernetes deployment YAML for a provisioned cluster.
 
@@ -679,17 +906,27 @@ def get_cluster_deployment_yaml(
     return {"deployment_yaml": yaml_content}
 
 @mcp.tool()
-def list_all_provisioned_clusters(authorization: str | None = None) -> Dict[str, Any]:
+def list_all_provisioned_clusters(
+    view_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted)",
+        ),
+    ] = None,
+    authorization: str | None = None,
+) -> dict[str, Any]:
     """
     Get list of all clusters provisioned for Cloudability monitoring.
 
     Args:
+        view_id: Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted)
         authorization: Bearer token or Basic auth header
 
     Returns:
         List of provisioned clusters with their configurations and status
     """
-    return list_provisioned_clusters(authorization)
+    return list_provisioned_clusters(view_id=view_id, authorization=authorization)
 
 @mcp.tool()
 def update_cluster_configuration(
@@ -697,7 +934,7 @@ def update_cluster_configuration(
     kubernetes_version: str | None = None,
     cluster_version: str | None = None,
     authorization: str | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Update the configuration of a provisioned cluster.
 
@@ -723,8 +960,15 @@ def update_cluster_configuration(
 def get_detailed_cluster_info(
     start_date: str,
     end_date: str,
-    authorization: str | None = None
-) -> Dict[str, Any]:
+    view_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted)",
+        ),
+    ] = None,
+    authorization: str | None = None,
+) -> dict[str, Any]:
     """
     Get comprehensive information about clusters and their nodes.
 
@@ -734,6 +978,7 @@ def get_detailed_cluster_info(
     Args:
         start_date: Start date for cluster data window (YYYY-MM-DD)
         end_date: End date for cluster data window (YYYY-MM-DD)
+        view_id: Cloudability view ID (required unless CLOUDABILITY_DEFAULT_VIEW_ID is set)
         authorization: Bearer token or Basic auth header
 
     Returns:
@@ -743,74 +988,25 @@ def get_detailed_cluster_info(
         - Data collection timestamps (firstSeen, lastSeen)
         - Organization metadata (hasProvisioned, hasData)
     """
-    return get_container_clusters(start_date, end_date, authorization)
-
-@mcp.tool()
-def analyze_container_cost_allocations(
-    start_date: str,
-    end_date: str,
-    group: List[str] | None = None,
-    metrics: List[str] | None = None,
-    filters: List[str] | None = None,
-    cost_type: str = "adjusted_cost",
-    authorization: str | None = None
-) -> Dict[str, Any]:
-    """
-    Perform comprehensive container cost allocation analysis.
-
-    This is the primary tool for understanding how shared Kubernetes resources
-    are being used and how costs should be allocated across teams, namespaces,
-    services, and other dimensions.
-
-    Args:
-        start_date: Start date (YYYY-MM-DD)
-        end_date: End date (YYYY-MM-DD)
-        group: Grouping dimensions (e.g., ["namespace", "service", "deployment"])
-        metrics: Resource metrics (e.g., ["cpu/reserved", "memory/reserved_rss", "network/tx"])
-        filters: Filter expressions (e.g., ["cluster==uuid", "namespace==production"])
-        cost_type: Cost basis - "adjusted_cost", "adjusted_amortized_cost", or empty
-        authorization: Bearer token or Basic auth header
-
-    Returns:
-        Comprehensive allocation data including:
-        - Cost allocations by group with fair share calculations
-        - Resource usage metrics (CPU, memory, network, filesystem)
-        - Allocation percentages and unallocated resources
-        - Available resources and weighting factors
-
-    Available Grouping Dimensions:
-        - cluster, namespace, service, deployment, pod
-        - daemonset, job, replicaset, replication_controller
-        - cldy:labels:* (for custom Kubernetes labels)
-
-    Available Metrics:
-        - cpu/reserved, cpu/usage
-        - memory/reserved, memory/reserved_rss, memory/usage
-        - network/tx, network/rx
-        - filesystem/usage
-
-    Example Usage:
-        # Cost by namespace
-        group=["namespace"], metrics=["cpu/reserved", "memory/reserved_rss"]
-
-        # Service-level analysis for specific cluster
-        group=["service"], filters=["cluster==abc-123", "namespace==production"]
-
-        # Team allocation using labels
-        group=["cldy:labels:team"], metrics=["cpu/reserved"]
-    """
-    return get_container_allocations(
-        start_date, end_date, group, metrics, filters, cost_type, authorization
+    return get_container_clusters(
+        start_date, end_date, view_id=view_id, concise=False, authorization=authorization
     )
 
 @mcp.tool()
 def get_container_resource_usage(
     start_date: str,
     end_date: str,
-    metrics: List[str] | None = None,
-    filters: List[str] | None = None,
-    authorization: str | None = None
-) -> Dict[str, Any]:
+    metrics: StrList | None = None,
+    filters: StrList | None = None,
+    view_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted)",
+        ),
+    ] = None,
+    authorization: str | None = None,
+) -> dict[str, Any]:
     """
     Get daily container resource usage trends and patterns.
 
@@ -822,6 +1018,7 @@ def get_container_resource_usage(
         end_date: End date (YYYY-MM-DD)
         metrics: Resource metrics to analyze (e.g., ["cpu/reserved", "filesystem/usage"])
         filters: Filter expressions to scope the analysis
+        view_id: Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted)
         authorization: Bearer token or Basic auth header
 
     Returns:
@@ -837,15 +1034,35 @@ def get_container_resource_usage(
         - Identifying resource waste or constraints
         - Tracking efficiency improvements over time
     """
-    return get_container_usage(start_date, end_date, metrics, filters, authorization)
+    return get_container_usage(
+        start_date, end_date, metrics, filters, view_id, authorization
+    )
 
 @mcp.tool()
 def discover_container_labels(
     start_date: str,
     end_date: str,
-    filters: List[str] | None = None,
-    authorization: str | None = None
-) -> Dict[str, Any]:
+    filters: Annotated[
+        StrList | None,
+        Field(
+            default=None,
+            description=(
+                "Filter expressions using the same syntax as containers_report. "
+                "Scope to a cluster with "
+                "cluster==<uuid> (resolve UUID via list_clusters; clusterName is not "
+                "valid). Examples: namespace==kube-system, workload_type==deployment."
+            ),
+        ),
+    ] = None,
+    view_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description="Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted)",
+        ),
+    ] = None,
+    authorization: str | None = None,
+) -> dict[str, Any]:
     """
     Discover Kubernetes labels available for cost allocation and filtering.
 
@@ -855,7 +1072,8 @@ def discover_container_labels(
     Args:
         start_date: Start date (YYYY-MM-DD)
         end_date: End date (YYYY-MM-DD)
-        filters: Filter expressions to scope the discovery
+        filters: Same filter syntax as containers_report (cluster==uuid, not clusterName)
+        view_id: Cloudability view ID (uses CLOUDABILITY_DEFAULT_VIEW_ID if omitted)
         authorization: Bearer token or Basic auth header
 
     Returns:
@@ -865,75 +1083,52 @@ def discover_container_labels(
         Use discovered labels in other tools with the format "cldy:labels:LABELNAME"
         For example, if you discover a "team" label, use "cldy:labels:team" in
         grouping or filtering expressions.
+
+    Example:
+        list_clusters → then filters=["cluster==dd2d2d9a-6d6b-4965-8fbf-3482f9a4e7a3"]
     """
-    return get_container_labels(start_date, end_date, filters, authorization)
-
-@mcp.tool()
-def count_container_resources(
-    start_date: str,
-    end_date: str,
-    dimensions: List[str],
-    group: List[str] | None = None,
-    filters: List[str] | None = None,
-    authorization: str | None = None
-) -> Dict[str, Any]:
-    """
-    Count distinct container resources across dimensions.
-
-    Provides counts of namespaces, services, pods, deployments, and other
-    Kubernetes resources, optionally grouped by cluster or other dimensions.
-
-    Args:
-        start_date: Start date (YYYY-MM-DD)
-        end_date: End date (YYYY-MM-DD)
-        dimensions: Dimensions to count (e.g., ["namespace", "service", "pod"])
-        group: Group results by dimensions (e.g., ["cluster"])
-        filters: Filter expressions to scope the counting
-        authorization: Bearer token or Basic auth header
-
-    Returns:
-        Counts of distinct values grouped by specified dimensions
-
-    Available Dimensions:
-        - cluster, namespace, service, deployment, pod
-        - daemonset, job, replicaset, replication_controller
-        - cldy:labels:* (for custom labels)
-
-    Perfect for:
-        - Understanding cluster scale and complexity
-        - Resource inventory and governance
-        - Capacity planning across environments
-        - Comparing cluster sizes and configurations
-    """
-    return get_container_counts(start_date, end_date, dimensions, group, filters, authorization)
+    return get_container_labels(start_date, end_date, filters, view_id, authorization)
 
 # ============================================================================
-# LEGACY TOOLS (for backward compatibility)
+# REFERENCE RESOURCES
 # ============================================================================
 
-@mcp.tool()
-def get_cost_reports(start_date: str, end_date: str, dimensions: list[str] | None = None, authorization: str | None = None):
-    """
-    Legacy cost reports endpoint for backward compatibility.
-
-    Note: This endpoint may not reflect the actual Cloudability API structure.
-    Consider using containers_report for comprehensive cost analysis.
-    """
-    return get_cost_reports_legacy(start_date, end_date, dimensions, authorization)
-
-@mcp.tool()
-def get_usage_data(period: str, authorization: str | None = None):
-    """
-    Legacy usage data endpoint for backward compatibility.
-
-    Note: This endpoint may not reflect the actual Cloudability API structure.
-    Consider using containers_report for comprehensive usage analysis.
-    """
-    return get_usage_data_legacy(period, authorization)
-
-# Internal functions for testing
-_get_cost_reports = get_cost_reports_legacy
-_get_usage_data = get_usage_data_legacy
+register_resources(mcp)
 
 if __name__ == "__main__":
-    mcp.run()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run the Cloudability MCP server")
+    parser.add_argument(
+        "--transport",
+        "-t",
+        choices=["stdio", "http", "sse", "streamable-http"],
+        help="Transport protocol (default: stdio, or FASTMCP_TRANSPORT env var)",
+    )
+    parser.add_argument("--host", help="Host to bind for HTTP transports")
+    parser.add_argument("--port", "-p", type=int, help="Port to bind for HTTP transports")
+    parser.add_argument("--path", help="Route path for HTTP transports")
+    parser.add_argument(
+        "--log-level",
+        "-l",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Log level",
+    )
+    parser.add_argument("--no-banner", action="store_true", help="Suppress the server banner")
+    args = parser.parse_args()
+
+    run_kwargs: dict[str, Any] = {}
+    if args.transport is not None:
+        run_kwargs["transport"] = args.transport
+    if args.host is not None:
+        run_kwargs["host"] = args.host
+    if args.port is not None:
+        run_kwargs["port"] = args.port
+    if args.path is not None:
+        run_kwargs["path"] = args.path
+    if args.log_level is not None:
+        run_kwargs["log_level"] = args.log_level
+    if args.no_banner:
+        run_kwargs["show_banner"] = False
+
+    mcp.run(**run_kwargs)
