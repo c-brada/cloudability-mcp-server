@@ -31,12 +31,8 @@ categories:
     description: "Budget management and spending predictions"
     priority: "medium"
   - name: "Core Resources"
-    description: "Clusters, billing accounts, and basic information"
+    description: "Clusters, vendor accounts, and basic information"
     priority: "medium"
-  - name: "Legacy Endpoints"
-    description: "Backward compatibility endpoints"
-    priority: "low"
-
 actions:
   # ============================================================================
   # 🔥 CONTAINER ANALYTICS TOOLS (HIGH PRIORITY)
@@ -91,56 +87,6 @@ actions:
           type: string
           description: "Complete Kubernetes deployment configuration"
 
-  analyze_container_cost_allocations:
-    category: "Container Analytics"
-    description: "🔥 PRIMARY TOOL: Comprehensive Kubernetes cost allocation with fair share calculations"
-    priority: "critical"
-    input_schema:
-      type: object
-      required: ["start_date", "end_date", "authorization"]
-      properties:
-        start_date:
-          type: string
-          format: date
-          description: "Start date (YYYY-MM-DD)"
-        end_date:
-          type: string
-          format: date
-          description: "End date (YYYY-MM-DD)"
-        group:
-          type: array
-          items:
-            type: string
-          description: "Grouping dimensions (namespace, service, deployment, pod, labels)"
-          examples:
-            [["namespace"], ["namespace", "service"], ["cldy:labels:team"]]
-        metrics:
-          type: array
-          items:
-            type: string
-          description: "Resource metrics (cpu/reserved, memory/reserved_rss, network/tx)"
-          examples: [["cpu/reserved", "memory/reserved_rss"]]
-        filters:
-          type: array
-          items:
-            type: string
-          description: "Filter expressions (cluster==uuid, namespace==production)"
-          examples: [["cluster==uuid", "namespace==production"]]
-        cost_type:
-          type: string
-          enum: ["adjusted_cost", "adjusted_amortized_cost"]
-          default: "adjusted_cost"
-          description: "Cost calculation method"
-        authorization:
-          type: string
-          description: "Bearer token or Basic auth header"
-    output_schema:
-      type: object
-      properties:
-        results:
-          type: array
-          description: "Cost allocations with fair share calculations and resource metrics"
-
   get_container_resource_usage:
     category: "Container Analytics"
     description: "Daily container resource usage trends for capacity planning and rightsizing"
@@ -190,6 +136,9 @@ actions:
           type: array
           items:
             type: string
+          description: >-
+            Same syntax as containers_report filters. Use cluster==<uuid> from
+            list_clusters (clusterName is not valid). Examples: namespace==kube-system
         authorization:
           type: string
     output_schema:
@@ -198,42 +147,6 @@ actions:
         results:
           type: array
           description: "Available label keys for cost allocation"
-
-  count_container_resources:
-    category: "Container Analytics"
-    description: "Resource inventory - count namespaces, services, pods across clusters"
-    input_schema:
-      type: object
-      required: ["start_date", "end_date", "dimensions", "authorization"]
-      properties:
-        start_date:
-          type: string
-          format: date
-        end_date:
-          type: string
-          format: date
-        dimensions:
-          type: array
-          items:
-            type: string
-          description: "Dimensions to count (namespace, service, pod)"
-        group:
-          type: array
-          items:
-            type: string
-          description: "Grouping dimensions"
-        filters:
-          type: array
-          items:
-            type: string
-        authorization:
-          type: string
-    output_schema:
-      type: object
-      properties:
-        results:
-          type: array
-          description: "Resource counts by dimension"
 
   get_detailed_cluster_info:
     category: "Container Analytics"
@@ -497,8 +410,7 @@ actions:
       properties:
         view_id:
           type: string
-          default: "0"
-          description: "View ID for filtering"
+          description: "View ID (omit to use CLOUDABILITY_DEFAULT_VIEW_ID; \"0\" = all org cost data)"
         basis:
           type: string
           enum: ["cash", "adjusted"]
@@ -508,10 +420,25 @@ actions:
           type: string
     output_schema:
       type: object
+      description: "Cloudability v3 envelope; estimate fields are nested under result"
       properties:
-        estimate:
+        result:
           type: object
-          description: "Current month spending estimate with service breakdown"
+          description: "Current month estimate summary and service breakdown"
+          properties:
+            estimatedSpend:
+              type: number
+            previousMonthSpend:
+              type: number
+            previousMonthFinalized:
+              type: boolean
+            currentDate:
+              type: string
+            cumulativeMtdSpend:
+              type: array
+            details:
+              type: array
+              description: "Service-level spending drivers (serviceName, estimatedSpend, mtdSpend, previousMonthSpend, usageFamily)"
 
   get_spending_forecast:
     category: "Budgets & Forecasting"
@@ -522,7 +449,7 @@ actions:
       properties:
         view_id:
           type: string
-          default: "0"
+          description: "View ID (omit to use CLOUDABILITY_DEFAULT_VIEW_ID; \"0\" = all org cost data)"
         basis:
           type: string
           enum: ["cash", "adjusted"]
@@ -555,10 +482,11 @@ actions:
           type: string
     output_schema:
       type: object
+      description: "Cloudability v3 envelope; forecast fields are nested under result"
       properties:
-        forecast:
+        result:
           type: object
-          description: "Monthly forecasts with confidence intervals"
+          description: "Forecast summary, monthly projections, and service detail"
 
   create_new_budget:
     category: "Budgets & Forecasting"
@@ -655,25 +583,102 @@ actions:
           type: array
           description: "List of clusters with UUIDs and metadata"
 
-  list_billing_accounts:
+  list_aws_accounts:
     category: "Core Resources"
-    description: "Get billing account information across cloud providers"
+    description: "Get AWS vendor credential accounts configured in Cloudability"
     input_schema:
       type: object
-      required: ["authorization"]
       properties:
+        view_id:
+          type: string
+          description: 'Cloudability view ID (defaults to "0" for all org accounts)'
         authorization:
           type: string
     output_schema:
       type: object
       properties:
-        accounts:
+        result:
           type: array
-          description: "Billing accounts with configurations"
+          description: "AWS vendor credential accounts"
+
+  list_azure_accounts:
+    category: "Core Resources"
+    description: "Get Azure vendor credential accounts configured in Cloudability"
+    input_schema:
+      type: object
+      properties:
+        view_id:
+          type: string
+          description: 'Cloudability view ID (defaults to "0" for all org accounts)'
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        result:
+          type: array
+          description: "Azure vendor credential accounts"
+
+  list_gcp_accounts:
+    category: "Core Resources"
+    description: "Get GCP vendor credential accounts configured in Cloudability"
+    input_schema:
+      type: object
+      properties:
+        view_id:
+          type: string
+          description: 'Cloudability view ID (defaults to "0" for all org accounts)'
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        result:
+          type: array
+          description: "GCP vendor credential accounts"
+
+  list_ibm_accounts:
+    category: "Core Resources"
+    description: "Get IBM Cloud vendor credential accounts configured in Cloudability"
+    input_schema:
+      type: object
+      properties:
+        view_id:
+          type: string
+          description: 'Cloudability view ID (defaults to "0" for all org accounts)'
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        result:
+          type: array
+          description: "IBM Cloud vendor credential accounts"
+
+  list_oci_accounts:
+    category: "Core Resources"
+    description: "Get OCI vendor credential accounts configured in Cloudability"
+    input_schema:
+      type: object
+      properties:
+        view_id:
+          type: string
+          description: 'Cloudability view ID (defaults to "0" for all org accounts)'
+        authorization:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        result:
+          type: array
+          description: "OCI vendor credential accounts"
 
   containers_report:
     category: "Core Resources"
-    description: "Legacy container cost reporting endpoint"
+    description: >-
+      Kubernetes workload cost report (fairshare-allocated total_cost). Does not
+      include unallocated/idle overhead in namespace rows. Use execute_cost_report
+      for billing, idle, and amortized metrics.
     input_schema:
       type: object
       required: ["start_date", "end_date", "authorization"]
@@ -691,20 +696,56 @@ actions:
           type: array
           items:
             type: string
+          description: >-
+            Defaults to ["total_cost", "total_cost_efficiency"] if omitted.
+            total_cost is fairshare-allocated workload cost, NOT billing cost.
         group:
           type: array
           items:
             type: string
+          description: >-
+            cluster, namespace, workload_type, workload_name, pod, cldy:labels:<key>, etc.
+            Time grouping: only day (not month); requires widget_type bar or line.
+            top must not include time dimensions.
+          examples:
+            [["namespace"], ["cldy:labels:team"], ["day", "namespace"]]
+        count:
+          type: array
+          items:
+            type: string
+          description: >-
+            Distinct-value counts per result row (replaces retired /containers/counts).
+            Returns result.data[].count entries. Examples: namespace, workload_name, pod.
+          examples:
+            [["namespace"], ["workload_name"], ["namespace", "pod"]]
         filters:
           type: array
           items:
             type: string
+          description: >-
+            cluster==<uuid> from list_clusters (not clusterName), namespace==name, etc.
+          examples:
+            [["cluster==uuid", "namespace==production"]]
         widget_type:
           type: string
           default: "top"
+          description: >-
+            top (table, default), bar, or line. kpi is remapped to top (API returns
+            HTTP 400 for kpi) — use top with no group for org totals or
+            group=["cluster"] with a cluster filter for cluster totals. Use bar/line
+            only with group including day. top must not include day/month in group.
+          enum: ["top", "kpi", "bar", "line"]
         limit:
           type: integer
           default: 50
+          description: >-
+            Max rows (1-1000). Results may truncate; pass pagination_token from
+            result.pagination.nextToken to fetch additional pages.
+        pagination_token:
+          type: string
+          description: >-
+            Pagination token from result.pagination.nextToken. Other parameters must
+            match the original query exactly when paginating.
         sort:
           type: array
           items:
@@ -715,53 +756,6 @@ actions:
       type: object
       properties:
         results:
-          type: array
-
-  # ============================================================================
-  # 🔄 LEGACY ENDPOINTS (LOW PRIORITY)
-  # ============================================================================
-
-  get_cost_reports:
-    category: "Legacy Endpoints"
-    description: "Legacy cost reports endpoint for backward compatibility"
-    input_schema:
-      type: object
-      required: ["start_date", "end_date", "authorization"]
-      properties:
-        start_date:
-          type: string
-          format: date
-        end_date:
-          type: string
-          format: date
-        dimensions:
-          type: array
-          items:
-            type: string
-        authorization:
-          type: string
-    output_schema:
-      type: object
-      properties:
-        results:
-          type: array
-
-  get_usage_data:
-    category: "Legacy Endpoints"
-    description: "Legacy usage data endpoint for backward compatibility"
-    input_schema:
-      type: object
-      required: ["period", "authorization"]
-      properties:
-        period:
-          type: string
-          description: "Usage period (e.g., last_30_days)"
-        authorization:
-          type: string
-    output_schema:
-      type: object
-      properties:
-        usage_records:
           type: array
 
 # ============================================================================
@@ -779,7 +773,7 @@ rate_limits:
 
 usage_notes:
   - "Container analytics APIs are the most important and frequently used"
-  - "Use analyze_container_cost_allocations for primary Kubernetes cost analysis"
+  - "Use containers_report for primary Kubernetes cost analysis and resource counts"
   - "Bearer token authentication is recommended for modern environments"
   - "Basic auth is supported for legacy API key authentication"
   - "Set CLOUDABILITY_ENVIRONMENT_ID for Bearer token authentication"

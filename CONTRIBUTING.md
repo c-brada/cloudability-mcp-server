@@ -6,7 +6,7 @@ Thank you for your interest in contributing to the Cloudability MCP Server! This
 
 ### Prerequisites
 
-- **Python 3.12+**: Required for modern type annotations
+- **Python 3.14+**: Required for modern type annotations
 - **uv**: Fast Python package manager
 - **Git**: For version control
 - **Cloudability API Access**: For testing (optional but recommended)

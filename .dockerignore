@@ -1,0 +1,31 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets and local config
+.env
+
+# Dev tooling and CI
+.cursor/
+.github/
+tests/
+Makefile
+
+# Documentation (not needed at runtime)
+README.md
+DEVELOPMENT.md
+CONTRIBUTING.md
+tool.yaml
+LICENSE
+
+# Docker build files
+Dockerfile
+.dockerignore
